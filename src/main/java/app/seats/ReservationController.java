@@ -1,0 +1,118 @@
+package app.seats;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.sql.Array;
+import java.util.*;
+
+/**
+ * Reserve = one transaction through three atomic gates, always locked in this order
+ * (reservation key -> user counter -> seats sorted by label), so no two transactions
+ * can wait on each other in a cycle:
+ *   1. idempotency: INSERT ... ON CONFLICT (user_id, idem_key) DO NOTHING
+ *   2. per-user limit: UPDATE user_counts ... WHERE seat_count + n <= limit
+ *   3. seats: lock rows ORDER BY label, then UPDATE ... WHERE status = 'available'
+ * Any decline throws ApiError -> the whole transaction rolls back (all-or-nothing).
+ */
+@RestController
+public class ReservationController {
+    private final JdbcTemplate db;
+    private final Auth auth;
+
+    ReservationController(JdbcTemplate db, Auth auth) {
+        this.db = db;
+        this.auth = auth;
+    }
+
+    record ReserveRequest(List<String> seats, String idempotencyKey) {}
+    record Reservation(UUID reservationId, UUID showId, String userId, List<String> seats, long amountPaise, String status) {}
+
+    @PostMapping("/shows/{showId}/reserve")
+    @Transactional
+    ResponseEntity<Reservation> reserve(@PathVariable UUID showId,
+                                        @RequestHeader(value = "Authorization", required = false) String authz,
+                                        @RequestHeader(value = "Idempotency-Key", required = false) String keyHeader,
+                                        @RequestBody ReserveRequest req) {
+        String userId = auth.userId(authz);
+        String key = keyHeader != null ? keyHeader : req.idempotencyKey();
+        if (key == null || key.isBlank() || key.length() > 128) throw ApiError.badRequest("idempotency_key is required (max 128 chars)");
+        if (req.seats() == null || req.seats().isEmpty()) throw ApiError.badRequest("seats must be non-empty");
+        List<String> seats = req.seats().stream().distinct().sorted().toList();
+        if (seats.size() != req.seats().size()) throw ApiError.badRequest("seats must be unique");
+        String requestHash = showId + ":" + String.join(",", seats);
+
+        var show = db.queryForList("SELECT price_paise, per_user_limit FROM shows WHERE id = ?", showId);
+        if (show.isEmpty()) throw ApiError.notFound("show not found");
+        long amount = ((Number) show.get(0).get("price_paise")).longValue() * seats.size();
+        int limit = ((Number) show.get(0).get("per_user_limit")).intValue();
+
+        // Gate 1: idempotency. A concurrent request with the same key blocks on the unique
+        // index until this transaction commits (then sees our row) or rolls back (then wins).
+        UUID id = UUID.randomUUID();
+        int inserted = db.update(con -> {
+            var ps = con.prepareStatement("""
+                    INSERT INTO reservations (id, show_id, user_id, idem_key, request_hash, seats, amount_paise, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+                    ON CONFLICT (user_id, idem_key) DO NOTHING""");
+            ps.setObject(1, id);
+            ps.setObject(2, showId);
+            ps.setString(3, userId);
+            ps.setString(4, key);
+            ps.setString(5, requestHash);
+            ps.setArray(6, con.createArrayOf("text", seats.toArray()));
+            ps.setLong(7, amount);
+            return ps;
+        });
+        if (inserted == 0) {
+            var prior = db.queryForMap("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key);
+            if (!requestHash.equals(prior.get("request_hash")))
+                throw ApiError.conflict("idempotency_key_reused", "idempotency key was used with a different request");
+            return ResponseEntity.ok(toReservation(prior));  // replay: original result, nothing moves
+        }
+
+        // Gate 2: per-user limit, checked and incremented in one statement.
+        db.update("INSERT INTO user_counts (show_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING", showId, userId);
+        int counted = db.update("""
+                UPDATE user_counts SET seat_count = seat_count + ?
+                WHERE show_id = ? AND user_id = ? AND seat_count + ? <= ?""",
+                seats.size(), showId, userId, seats.size(), limit);
+        if (counted == 0) throw ApiError.conflict("per_user_limit", "would exceed per-user limit of " + limit);
+
+        // Gate 3: lock the requested seats in label order (deadlock-free), then flip only available ones.
+        Object[] labels = seats.toArray();
+        List<String> found = db.query(con -> {
+            var ps = con.prepareStatement("SELECT label FROM seats WHERE show_id = ? AND label = ANY(?) ORDER BY label FOR UPDATE");
+            ps.setObject(1, showId);
+            ps.setArray(2, con.createArrayOf("text", labels));
+            return ps;
+        }, (rs, i) -> rs.getString(1));
+        if (found.size() != seats.size()) throw ApiError.badRequest("unknown seats for this show");
+
+        int taken = db.update(con -> {
+            var ps = con.prepareStatement("""
+                    UPDATE seats SET status = 'confirmed', reservation_id = ?
+                    WHERE show_id = ? AND label = ANY(?) AND status = 'available'""");
+            ps.setObject(1, id);
+            ps.setObject(2, showId);
+            ps.setArray(3, con.createArrayOf("text", labels));
+            return ps;
+        });
+        if (taken != seats.size()) throw ApiError.conflict("seat_taken", "one or more seats are no longer available");
+
+        db.update("UPDATE reservations SET status = 'confirmed' WHERE id = ?", id);
+        return ResponseEntity.status(201).body(new Reservation(id, showId, userId, seats, amount, "confirmed"));
+    }
+
+    private static Reservation toReservation(Map<String, Object> r) {
+        try {
+            String[] seats = (String[]) ((Array) r.get("seats")).getArray();
+            return new Reservation((UUID) r.get("id"), (UUID) r.get("show_id"), (String) r.get("user_id"),
+                    List.of(seats), ((Number) r.get("amount_paise")).longValue(), (String) r.get("status"));
+        } catch (java.sql.SQLException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
