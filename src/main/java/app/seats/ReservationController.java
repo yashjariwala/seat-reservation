@@ -21,10 +21,17 @@ import java.util.*;
 public class ReservationController {
     private final JdbcTemplate db;
     private final Auth auth;
+    private final Obs obs;
 
-    ReservationController(JdbcTemplate db, Auth auth) {
+    ReservationController(JdbcTemplate db, Auth auth, Obs obs) {
         this.db = db;
         this.auth = auth;
+        this.obs = obs;
+    }
+
+    private ApiError decline(String reason, String msg) {
+        obs.declined(reason);
+        return ApiError.conflict(reason, msg);
     }
 
     record ReserveRequest(List<String> seats, String idempotencyKey) {}
@@ -69,7 +76,8 @@ public class ReservationController {
         if (inserted == 0) {
             var prior = db.queryForMap("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key);
             if (!requestHash.equals(prior.get("request_hash")))
-                throw ApiError.conflict("idempotency_key_reused", "idempotency key was used with a different request");
+                throw decline("idempotency_key_reused", "idempotency key was used with a different request");
+            obs.declined("idempotent_replay");
             return ResponseEntity.ok(toReservation(prior));  // replay: original result, nothing moves
         }
 
@@ -79,7 +87,7 @@ public class ReservationController {
                 UPDATE user_counts SET seat_count = seat_count + ?
                 WHERE show_id = ? AND user_id = ? AND seat_count + ? <= ?""",
                 seats.size(), showId, userId, seats.size(), limit);
-        if (counted == 0) throw ApiError.conflict("per_user_limit", "would exceed per-user limit of " + limit);
+        if (counted == 0) throw decline("per_user_limit", "would exceed per-user limit of " + limit);
 
         // Gate 3: lock the requested seats in label order (deadlock-free), then flip only available ones.
         Object[] labels = seats.toArray();
@@ -100,9 +108,10 @@ public class ReservationController {
             ps.setArray(3, con.createArrayOf("text", labels));
             return ps;
         });
-        if (taken != seats.size()) throw ApiError.conflict("seat_taken", "one or more seats are no longer available");
+        if (taken != seats.size()) throw decline("seat_taken", "one or more seats are no longer available");
 
         db.update("UPDATE reservations SET status = 'confirmed' WHERE id = ?", id);
+        obs.confirmed();
         return ResponseEntity.status(201).body(new Reservation(id, showId, userId, seats, amount, "confirmed"));
     }
 

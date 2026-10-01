@@ -44,6 +44,7 @@ public class Auth {
             String userId = new String(Base64.getUrlDecoder().decode(parts[0]), StandardCharsets.UTF_8);
             byte[] sig = Base64.getUrlDecoder().decode(parts[1]);
             if (!MessageDigest.isEqual(sig, sign(userId))) throw ApiError.unauthorized();
+            org.slf4j.MDC.put("user_id", userId);
             return userId;
         } catch (IllegalArgumentException e) {
             throw ApiError.unauthorized();
