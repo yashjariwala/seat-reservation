@@ -1,0 +1,18 @@
+# Render Blueprint: New > Blueprint > pick this repo. DB is Neon (free Postgres); paste its details when prompted.
+services:
+  - type: web
+    name: seat-reservation
+    runtime: docker
+    plan: free
+    healthCheckPath: /actuator/health/readiness
+    envVars:
+      - key: DATABASE_URL        # jdbc:postgresql://<neon-host>/<db>?sslmode=require
+        sync: false
+      - key: DATABASE_USER
+        sync: false
+      - key: DATABASE_PASSWORD
+        sync: false
+      - key: TOKEN_SECRET
+        generateValue: true
+      - key: ADMIN_KEY
+        generateValue: true
