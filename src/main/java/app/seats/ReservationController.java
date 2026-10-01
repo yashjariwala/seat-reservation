@@ -106,6 +106,29 @@ public class ReservationController {
         return ResponseEntity.status(201).body(new Reservation(id, showId, userId, seats, amount, "confirmed"));
     }
 
+    /**
+     * Only the owner can cancel (user_id comes from the token). Seats are freed WHERE reservation_id = this one,
+     * so a cancel can never release a seat that belongs to someone else. Lock order matches reserve:
+     * reservation row -> user counter -> seats sorted by label.
+     */
+    @PostMapping("/reservations/{id}/cancel")
+    @Transactional
+    Reservation cancel(@PathVariable UUID id,
+                       @RequestHeader(value = "Authorization", required = false) String authz) {
+        String userId = auth.userId(authz);
+        var rows = db.queryForList("SELECT * FROM reservations WHERE id = ? AND user_id = ? FOR UPDATE", id, userId);
+        if (rows.isEmpty()) throw ApiError.notFound("reservation not found");  // also for other users' ids: don't leak
+        Reservation r = toReservation(rows.get(0));
+        if (!"confirmed".equals(r.status())) return r;  // already cancelled: cancel is idempotent
+
+        db.update("UPDATE user_counts SET seat_count = seat_count - ? WHERE show_id = ? AND user_id = ?",
+                r.seats().size(), r.showId(), userId);
+        db.query("SELECT label FROM seats WHERE reservation_id = ? ORDER BY label FOR UPDATE", rs -> {}, id);
+        db.update("UPDATE seats SET status = 'available', reservation_id = NULL WHERE reservation_id = ?", id);
+        db.update("UPDATE reservations SET status = 'cancelled' WHERE id = ?", id);
+        return new Reservation(r.reservationId(), r.showId(), userId, r.seats(), r.amountPaise(), "cancelled");
+    }
+
     private static Reservation toReservation(Map<String, Object> r) {
         try {
             String[] seats = (String[]) ((Array) r.get("seats")).getArray();
