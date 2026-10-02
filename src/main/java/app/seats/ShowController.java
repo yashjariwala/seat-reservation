@@ -63,11 +63,12 @@ public class ShowController {
     }
 
     /**
-     * Seats and counts come from ONE query = one snapshot, so available+held+confirmed==total
-     * holds by construction (every seat row has exactly one status).
+     * counts come from ONE query over seat rows (one snapshot); total_seats is the count declared at creation.
+     * They are independent, so available+held+confirmed==total_seats is a real check: a lost or duplicated
+     * seat row would break it.
      */
     private Map<String, Object> show(UUID id) {
-        var shows = db.queryForList("SELECT id, name, price_paise, per_user_limit FROM shows WHERE id = ?", id);
+        var shows = db.queryForList("SELECT id, name, price_paise, per_user_limit, total_seats FROM shows WHERE id = ?", id);
         if (shows.isEmpty()) throw ApiError.notFound("show not found");
 
         Map<String, Integer> counts = new LinkedHashMap<>(Map.of("available", 0, "held", 0, "confirmed", 0));
@@ -79,7 +80,6 @@ public class ShowController {
         }, id);
 
         Map<String, Object> out = new LinkedHashMap<>(shows.get(0));
-        out.put("total_seats", seats.size());
         out.put("counts", counts);
         out.put("seats", seats);
         return out;

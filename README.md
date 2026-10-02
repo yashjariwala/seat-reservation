@@ -27,7 +27,7 @@ In VS Code: install the *Extension Pack for Java* + *Spring Boot Extension Pack*
 ADMIN_KEY=<key> ./burst.sh https://seat-reservation-62kf.onrender.com
 ```
 
-Creates a fresh show, then fires concurrently: a hot-seat storm (40% of traffic on 5 seats), a per-user-limit attack (20 users × 10 parallel requests on limit 4), exact retries of in-flight requests (10%), same-key-different-seats (1%), and random traffic. Prints the outcome distribution and checks every correctness rule against both the API and `/actuator/prometheus`; exits non-zero on any failure.
+Creates a fresh show, then fires concurrently: a hot-seat storm (40% of traffic on 5 seats), a per-user-limit attack (20 users × 10 parallel requests on limit 4), exact retries of in-flight requests (10%), same-key-different-seats (1%), and random traffic. Then phase 2: for 200 confirmed reservations, concurrently, the owner cancels twice, an attacker tries to cancel, and three other users try to rebook the freed seats with `"user_id": <owner>` spoofed in the body. Prints the outcome distribution and checks every correctness rule against both the API and `/actuator/prometheus`; exits non-zero on any failure.
 
 Local result (M-series Mac, Postgres 16, pool of 10):
 
@@ -85,6 +85,6 @@ curl -s -XPOST $B/shows/$SHOW/reserve -H "Authorization: Bearer $TOKEN" -H 'cont
 2. Render: *New → Blueprint* → this repo (uses `render.yaml`). Set
    `DATABASE_URL=jdbc:postgresql://<host>/<db>?sslmode=require`, `DATABASE_USER`, `DATABASE_PASSWORD`.
    `TOKEN_SECRET` and `ADMIN_KEY` are generated; copy `ADMIN_KEY` for `burst.sh`.
-3. Render health check uses the readiness probe, so a deploy only goes live once the DB is reachable.
+3. No Render health check, deliberately: Render evicts an instance whose check takes >5s for 15s and restarts it after 60s; on 0.1 CPU a burst queues health checks past that, so the check would take down a busy-but-correct instance. In Render → Settings, leave **Health Check Path empty**. A crashed process is still restarted.
 
 Config: `PORT`, `DATABASE_URL`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DB_POOL_SIZE` (10), `TOKEN_SECRET`, `ADMIN_KEY`.
