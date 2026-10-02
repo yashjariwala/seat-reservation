@@ -7,7 +7,6 @@ import org.springframework.web.bind.annotation.*;
 
 import java.sql.Array;
 import java.util.*;
-import java.util.stream.Collectors;
 
 /**
  * Reserve = one transaction through three atomic gates, always locked in this order
@@ -52,8 +51,6 @@ public class ReservationController {
         if (req.seats().stream().anyMatch(s -> s == null || s.isBlank())) throw ApiError.badRequest("seat labels must be non-blank");
         List<String> seats = req.seats().stream().distinct().sorted().toList();
         if (seats.size() != req.seats().size()) throw ApiError.badRequest("seats must be unique");
-        // Length-prefixed so it is unambiguous: ["A","B"] -> "1:A1:B", ["A,B"] -> "3:A,B".
-        String requestHash = showId + ":" + seats.stream().map(l -> l.length() + ":" + l).collect(Collectors.joining());
 
         var show = db.queryForList("SELECT price_paise, per_user_limit FROM shows WHERE id = ?", showId);
         if (show.isEmpty()) throw ApiError.notFound("show not found");
@@ -82,7 +79,7 @@ public class ReservationController {
         if (avail[0] != seats.size()) throw ApiError.badRequest("unknown seats for this show");
         if (avail[1] < seats.size()) {
             var prior = db.queryForList("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key);
-            if (!prior.isEmpty()) return replay(prior.get(0), requestHash);
+            if (!prior.isEmpty()) return replay(prior.get(0), showId, seats);
             throw decline("seat_taken", "one or more seats are no longer available");
         }
 
@@ -91,20 +88,19 @@ public class ReservationController {
         UUID id = UUID.randomUUID();
         int inserted = db.update(con -> {
             var ps = con.prepareStatement("""
-                    INSERT INTO reservations (id, show_id, user_id, idem_key, request_hash, seats, amount_paise, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+                    INSERT INTO reservations (id, show_id, user_id, idem_key, seats, amount_paise, status)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending')
                     ON CONFLICT (user_id, idem_key) DO NOTHING""");
             ps.setObject(1, id);
             ps.setObject(2, showId);
             ps.setString(3, userId);
             ps.setString(4, key);
-            ps.setString(5, requestHash);
-            ps.setArray(6, con.createArrayOf("text", seats.toArray()));
-            ps.setLong(7, amount);
+            ps.setArray(5, con.createArrayOf("text", seats.toArray()));
+            ps.setLong(6, amount);
             return ps;
         });
         if (inserted == 0)
-            return replay(db.queryForMap("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key), requestHash);
+            return replay(db.queryForMap("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key), showId, seats);
 
         // Gate 2: per-user limit, checked and incremented in one statement.
         db.update("INSERT INTO user_counts (show_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING", showId, userId);
@@ -162,12 +158,17 @@ public class ReservationController {
         return new Reservation(r.reservationId(), r.showId(), userId, r.seats(), r.amountPaise(), "cancelled");
     }
 
-    /** Same key seen before: same body -> the original reservation (200); different body -> 409. */
-    private ResponseEntity<Reservation> replay(Map<String, Object> prior, String requestHash) {
-        if (!requestHash.equals(prior.get("request_hash")))
+    /**
+     * Same key seen before: same body -> the original reservation (200); different body -> 409.
+     * "Same body" compares the stored show_id and sorted seat array directly, not a derived string, so it
+     * can't be ambiguous and works for every reservation ever stored.
+     */
+    private ResponseEntity<Reservation> replay(Map<String, Object> prior, UUID showId, List<String> seats) {
+        Reservation original = toReservation(prior);
+        if (!original.showId().equals(showId) || !original.seats().equals(seats))
             throw decline("idempotency_key_reused", "idempotency key was used with a different request");
         obs.declined("idempotent_replay");
-        return ResponseEntity.ok(toReservation(prior));  // nothing moves
+        return ResponseEntity.ok(original);  // nothing moves
     }
 
     private static Reservation toReservation(Map<String, Object> r) {

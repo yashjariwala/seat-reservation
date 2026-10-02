@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS reservations (
     UNIQUE (user_id, idem_key)
 );
 
+-- Replay now compares show_id + seats directly; request_hash is a legacy column, no longer written.
+ALTER TABLE reservations ALTER COLUMN request_hash DROP NOT NULL;
+
 -- Per-user seat counter; the limit check is a single guarded UPDATE on this row.
 CREATE TABLE IF NOT EXISTS user_counts (
     show_id    UUID NOT NULL REFERENCES shows(id),

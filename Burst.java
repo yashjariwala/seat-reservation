@@ -200,7 +200,7 @@ public class Burst {
         List<Res> victims = created.stream().filter(r -> r.req().kind().equals("cold")).limit(200).toList();
         Map<String, String> p2tokens = new ConcurrentHashMap<>();
         List<String> p2users = new ArrayList<>(List.of("attacker"));
-        for (int i = 0; i < victims.size(); i++) for (int j = 0; j < 3; j++) p2users.add("rb-" + i + "-" + j);
+        for (int i = 0; i < victims.size(); i++) for (int j = 0; j < 4; j++) p2users.add("rb-" + i + "-" + j);  // j=3: guaranteed rebook
         runAll(p2users.stream().map(u -> (Callable<Object>) () -> {
             p2tokens.put(u, field(send("POST", "/auth/token", "{\"user_id\":\"" + u + "\"}", Map.of("X-Admin-Key", adminKey)).body(), "token"));
             return null;
@@ -251,13 +251,40 @@ public class Burst {
                 .collect(Collectors.groupingBy(P2::victim, Collectors.counting()));
         long multiWin = rebookWins.values().stream().filter(n -> n > 1).count();
         check(fails, multiWin == 0, "freed seats rebooked by at most one user each (victims with >1 winner=" + multiWin + ")");
-        int cancelledSeats = victims.stream().mapToInt(v -> v.req().seats().size()).sum();
-        int rebookedSeats = rebookWins.keySet().stream().mapToInt(vi -> victims.get(vi).req().seats().size()).sum();
-        int[] c2 = counts(get("/shows/" + show).body());
-        int expected = c[2] - cancelledSeats + rebookedSeats;
-        System.out.printf("  rebooked %d of %d victims; final available=%d held=%d confirmed=%d total=%d%n",
-                rebookWins.size(), victims.size(), c2[0], c2[1], c2[2], c2[3]);
-        check(fails, c2[2] == expected, "confirmed after phase 2 (" + c2[2] + ") == before - cancelled + rebooked (" + expected + ")");
+        // Guaranteed rebook: every victim is cancelled by now, so a fresh user (still spoofing the owner) must win
+        // any victim nobody won during the race. Proves freed seats are cleanly re-bookable, not just "not broken".
+        List<Callable<Object>> late = new ArrayList<>();
+        for (int i = 0; i < victims.size(); i++) {
+            if (rebookWins.containsKey(i)) continue;
+            int vi = i;
+            String u = "rb-" + i + "-3";
+            Res v = victims.get(i);
+            String body = "{\"user_id\":\"" + v.req().user() + "\",\"idempotency_key\":\"" + show.substring(0, 8) + "-late-" + i
+                    + "\",\"seats\":[" + v.req().seats().stream().map(s -> "\"" + s + "\"").collect(Collectors.joining(",")) + "]}";
+            late.add(() -> {
+                var resp = send("POST", "/shows/" + show + "/reserve", body, Map.of("Authorization", "Bearer " + p2tokens.get(u)));
+                p2.add(new P2("late_rebook", vi, u, resp.statusCode(), resp.body()));
+                return null;
+            });
+        }
+        runAll(late, conc);
+        List<P2> lateRes = p2.stream().filter(x -> x.kind().equals("late_rebook")).toList();
+        long lateBad = lateRes.stream().filter(x -> x.status() != 201 || !field(x.body(), "user_id").equals(x.user())).count();
+        System.out.printf("  rebooked during race: %d of %d victims; guaranteed rebook after cancel: %d%n",
+                rebookWins.size(), victims.size(), lateRes.size());
+        check(fails, lateBad == 0, "post-cancel rebook succeeds as the token's user, spoof ignored (bad=" + lateBad + " of " + lateRes.size() + ")");
+
+        // Every victim's seats are now confirmed again (to a rebooker), so confirmed is back to the pre-phase-2 count,
+        // and each of those seats reads "confirmed" in the show state.
+        String state = get("/shows/" + show).body();
+        int[] c2 = counts(state);
+        Set<String> confirmedLabels = new HashSet<>();
+        Matcher sm = Pattern.compile("\\{\"label\":\"([^\"]+)\",\"status\":\"confirmed\"\\}|\\{\"status\":\"confirmed\",\"label\":\"([^\"]+)\"\\}").matcher(state);
+        while (sm.find()) confirmedLabels.add(sm.group(1) != null ? sm.group(1) : sm.group(2));
+        long notConfirmed = victims.stream().flatMap(v -> v.req().seats().stream()).filter(l -> !confirmedLabels.contains(l)).count();
+        System.out.printf("  final available=%d held=%d confirmed=%d total=%d%n", c2[0], c2[1], c2[2], c2[3]);
+        check(fails, notConfirmed == 0, "every cancelled seat ended confirmed to exactly one rebooker (not confirmed=" + notConfirmed + ")");
+        check(fails, c2[2] == c[2], "confirmed after phase 2 (" + c2[2] + ") == before (" + c[2] + "): every cancel matched by one rebook");
         check(fails, c2[0] + c2[1] + c2[2] == c2[3], "reconciliation after phase 2: available+held+confirmed == total");
 
         System.out.println(fails.isEmpty() ? "\nALL CHECKS PASSED" : "\nFAILED: " + fails.size() + " check(s)");
