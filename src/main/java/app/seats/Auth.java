@@ -22,11 +22,20 @@ public class Auth {
 
     private final byte[] secret;
     private final byte[] adminKey;
+    // Mac is mutable: each request thread owns its initialized signer.
+    private final ThreadLocal<Mac> signers;
 
     Auth(@Value("${TOKEN_SECRET:dev-token-secret}") String secret,
          @Value("${ADMIN_KEY:dev-admin-key}") String adminKey) {
         this.secret = secret.getBytes(StandardCharsets.UTF_8);
         this.adminKey = adminKey.getBytes(StandardCharsets.UTF_8);
+        this.signers = ThreadLocal.withInitial(() -> {
+            try {
+                Mac mac = Mac.getInstance("HmacSHA256");
+                mac.init(new SecretKeySpec(this.secret, "HmacSHA256"));
+                return mac;
+            } catch (Exception e) { throw new IllegalStateException(e); }
+        });
     }
 
     String issue(String userId) {
@@ -57,12 +66,7 @@ public class Auth {
     }
 
     private byte[] sign(String userId) {
-        try {
-            Mac mac = Mac.getInstance("HmacSHA256");
-            mac.init(new SecretKeySpec(secret, "HmacSHA256"));
-            return mac.doFinal(userId.getBytes(StandardCharsets.UTF_8));
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
+        // doFinal resets the Mac to its initialized state for the next message.
+        return signers.get().doFinal(userId.getBytes(StandardCharsets.UTF_8));
     }
 }

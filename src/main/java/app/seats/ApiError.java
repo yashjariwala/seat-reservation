@@ -13,7 +13,10 @@ public class ApiError extends RuntimeException {
     final String code;
 
     ApiError(HttpStatus status, String code, String message) {
-        super(message);
+        // Expected 4xx outcomes are control flow; collecting a stack for every
+        // losing contender wastes CPU during hot-seat bursts. Unexpected errors
+        // remain ordinary exceptions with full diagnostic stacks.
+        super(message, null, false, false);
         this.status = status;
         this.code = code;
     }
