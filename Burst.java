@@ -30,7 +30,10 @@ public class Burst {
         int conc = a.length > 2 ? Integer.parseInt(a[2]) : 1000;
         int nSeats = a.length > 3 ? Integer.parseInt(a[3]) : 5000;
         String adminKey = Optional.ofNullable(System.getenv("ADMIN_KEY")).orElse("dev-admin-key");
-        http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1)
+        // HTTPS: HTTP/2 multiplexes the burst over a few TLS connections instead of a handshake per in-flight
+        // request (the edge resets handshake storms from one IP). Plain http (local) stays HTTP/1.1.
+        http = HttpClient.newBuilder()
+                .version(base.startsWith("https") ? HttpClient.Version.HTTP_2 : HttpClient.Version.HTTP_1_1)
                 .connectTimeout(Duration.ofSeconds(30))
                 .executor(Executors.newFixedThreadPool(32)).build();
 
@@ -79,10 +82,14 @@ public class Burst {
         Set<String> users = reqs.stream().map(Req::user).collect(Collectors.toSet());
         System.out.printf("minting %d tokens...%n", users.size());
         runAll(users.stream().map(u -> (Callable<Object>) () -> {
-            for (int attempt = 1; ; attempt++) {   // setup, not the test: retry transient edge errors
-                HttpResponse<String> r = send("POST", "/auth/token", "{\"user_id\":\"" + u + "\"}", Map.of("X-Admin-Key", adminKey));
-                if (r.statusCode() == 200) { tokens.put(u, field(r.body(), "token")); return null; }
-                if (attempt == 5) throw new IllegalStateException("token mint failed: " + r.statusCode() + " " + r.body());
+            for (int attempt = 1; ; attempt++) {   // setup, not the test: retry transient edge/network errors
+                try {
+                    HttpResponse<String> r = send("POST", "/auth/token", "{\"user_id\":\"" + u + "\"}", Map.of("X-Admin-Key", adminKey));
+                    if (r.statusCode() == 200) { tokens.put(u, field(r.body(), "token")); return null; }
+                    if (attempt == 5) throw new IllegalStateException("token mint failed: " + r.statusCode() + " " + r.body());
+                } catch (java.io.IOException e) {
+                    if (attempt == 5) throw e;
+                }
                 Thread.sleep(500L * attempt);
             }
         }).toList(), 200);
