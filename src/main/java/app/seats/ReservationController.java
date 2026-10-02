@@ -3,6 +3,8 @@ package app.seats;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.bind.annotation.*;
 
 import java.sql.Array;
@@ -23,11 +25,13 @@ public class ReservationController {
     private final JdbcTemplate db;
     private final Auth auth;
     private final Obs obs;
+    private final TransactionTemplate transactions;
 
-    ReservationController(JdbcTemplate db, Auth auth, Obs obs) {
+    ReservationController(JdbcTemplate db, Auth auth, Obs obs, PlatformTransactionManager manager) {
         this.db = db;
         this.auth = auth;
         this.obs = obs;
+        this.transactions = new TransactionTemplate(manager);
     }
 
     private ApiError decline(String reason, String msg) {
@@ -37,9 +41,9 @@ public class ReservationController {
 
     record ReserveRequest(List<String> seats, String idempotencyKey) {}
     record Reservation(UUID reservationId, UUID showId, String userId, List<String> seats, long amountPaise, String status) {}
+    record Preflight(long price, int limit, int matched, int available, Reservation prior) {}
 
     @PostMapping("/shows/{showId}/reserve")
-    @Transactional
     ResponseEntity<Reservation> reserve(@PathVariable UUID showId,
                                         @RequestHeader(value = "Authorization", required = false) String authz,
                                         @RequestHeader(value = "Idempotency-Key", required = false) String keyHeader,
@@ -52,36 +56,51 @@ public class ReservationController {
         List<String> seats = req.seats().stream().distinct().sorted().toList();
         if (seats.size() != req.seats().size()) throw ApiError.badRequest("seats must be unique");
 
-        // Metadata and requested seat state share one snapshot and one database round trip.
+        // One autocommit snapshot for metadata, seat state and the existing key.
+        // If this snapshot sees unavailable seats from a committed twin, it also sees
+        // that twin's reservation. Hot losers need no transaction or rollback round trip.
         Object[] labels = seats.toArray();
         var show = db.query(con -> {
             var ps = con.prepareStatement("""
                     SELECT s.price_paise, s.per_user_limit, count(t.label) AS matched,
-                           count(t.label) FILTER (WHERE t.status = 'available') AS available
-                    FROM shows s LEFT JOIN seats t ON t.show_id = s.id AND t.label = ANY(?)
-                    WHERE s.id = ? GROUP BY s.id""");
-            ps.setArray(1, con.createArrayOf("text", labels));
-            ps.setObject(2, showId);
+                           count(t.label) FILTER (WHERE t.status = 'available') AS available,
+                           r.id AS prior_id, r.show_id AS prior_show, r.user_id AS prior_user,
+                           r.seats AS prior_seats, r.amount_paise AS prior_amount, r.status AS prior_status
+                    FROM shows s
+                    LEFT JOIN reservations r ON r.user_id = ? AND r.idem_key = ?
+                    LEFT JOIN seats t ON t.show_id = s.id AND t.label = ANY(?)
+                    WHERE s.id = ? GROUP BY s.id, r.id""");
+            ps.setString(1, userId);
+            ps.setString(2, key);
+            ps.setArray(3, con.createArrayOf("text", labels));
+            ps.setObject(4, showId);
             return ps;
-        }, (rs, i) -> new long[]{rs.getLong("price_paise"), rs.getInt("per_user_limit"),
-                rs.getInt("matched"), rs.getInt("available")});
+        }, (rs, i) -> {
+            UUID priorId = (UUID) rs.getObject("prior_id");
+            Reservation prior = priorId == null ? null : new Reservation(priorId,
+                    (UUID) rs.getObject("prior_show"), rs.getString("prior_user"),
+                    List.of((String[]) rs.getArray("prior_seats").getArray()),
+                    rs.getLong("prior_amount"), rs.getString("prior_status"));
+            return new Preflight(rs.getLong("price_paise"), rs.getInt("per_user_limit"),
+                    rs.getInt("matched"), rs.getInt("available"), prior);
+        });
         if (show.isEmpty()) throw ApiError.notFound("show not found");
-        long[] state = show.get(0);
-        int limit = (int) state[1];
+        Preflight state = show.get(0);
+        int limit = state.limit();
         if (seats.size() > limit) throw decline("per_user_limit", "would exceed per-user limit of " + limit);
         long amount;
-        try { amount = Math.multiplyExact(state[0], seats.size()); }
+        try { amount = Math.multiplyExact(state.price(), seats.size()); }
         catch (ArithmeticException e) { throw ApiError.badRequest("amount overflows"); }
-        if (state[2] != seats.size()) throw ApiError.badRequest("unknown seats for this show");
-
-        // Read seats BEFORE the key: a committed twin's reservation is visible to the replay query.
-        // This is only a fast decline; locked conditional updates below remain the sale authority.
-        if (state[3] < seats.size()) {
-            var prior = db.queryForList("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key);
-            if (!prior.isEmpty()) return replay(prior.get(0), showId, seats);
+        if (state.matched() != seats.size()) throw ApiError.badRequest("unknown seats for this show");
+        if (state.prior() != null) return replay(state.prior(), showId, seats);
+        if (state.available() < seats.size())
             throw decline("seat_taken", "one or more seats are no longer available");
-        }
 
+        return transactions.execute(status -> book(showId, userId, key, seats, labels, amount, limit));
+    }
+
+    private ResponseEntity<Reservation> book(UUID showId, String userId, String key,
+                                             List<String> seats, Object[] labels, long amount, int limit) {
         // The confirmed row is invisible until commit; any later decline rolls it back with the seats.
         // Gate 1: idempotency. A concurrent request with the same key blocks on the unique
         // index until this transaction commits (then sees our row) or rolls back (then wins).
@@ -165,7 +184,10 @@ public class ReservationController {
      * can't be ambiguous and works for every reservation ever stored.
      */
     private ResponseEntity<Reservation> replay(Map<String, Object> prior, UUID showId, List<String> seats) {
-        Reservation original = toReservation(prior);
+        return replay(toReservation(prior), showId, seats);
+    }
+
+    private ResponseEntity<Reservation> replay(Reservation original, UUID showId, List<String> seats) {
         if (!original.showId().equals(showId) || !original.seats().equals(seats))
             throw decline("idempotency_key_reused", "idempotency key was used with a different request");
         obs.declined("idempotent_replay");

@@ -91,4 +91,26 @@ class ReservationIntegrationTest {
         }
         assertThat(reserve(id, token, "hot", List.of("C")).getStatusCode().value()).isEqualTo(409);
     }
+    @Test void concurrentSameKeyHasOneCreationAndCancelledReplayDoesNotRebook() throws Exception {
+        UUID id = show(List.of("A", "B"));
+        String token = auth.issue("same-key-" + UUID.randomUUID());
+        List<Callable<ResponseEntity<JsonNode>>> work = new ArrayList<>();
+        for (int i = 0; i < 40; i++) work.add(() -> reserve(id, token, "shared", List.of("A")));
+        var results = concurrent(work);
+        assertThat(results.stream().filter(r -> r.getStatusCode().value() == 201).count()).isEqualTo(1);
+        assertThat(results.stream().filter(r -> r.getStatusCode().value() == 200).count()).isEqualTo(39);
+        String reservation = results.get(0).getBody().path("reservation_id").asText();
+        assertThat(results).allSatisfy(r -> assertThat(r.getBody().path("reservation_id").asText()).isEqualTo(reservation));
+        HttpHeaders headers = new HttpHeaders(); headers.setBearerAuth(token);
+        var cancelled = http.postForEntity("/reservations/" + reservation + "/cancel",
+                new HttpEntity<>(Map.of(), headers), JsonNode.class);
+        assertThat(cancelled.getStatusCode().value()).isEqualTo(200);
+        var replay = reserve(id, token, "shared", List.of("A"));
+        assertThat(replay.getStatusCode().value()).isEqualTo(200);
+        assertThat(replay.getBody().path("status").asText()).isEqualTo("cancelled");
+        assertThat(reserve(id, token, "shared", List.of("B")).getStatusCode().value()).isEqualTo(409);
+        assertThat(db.queryForObject("SELECT count(*) FROM seats WHERE show_id=? AND status='available'", Integer.class, id)).isEqualTo(2);
+        assertThat(db.queryForObject("SELECT count(*) FROM reservations WHERE show_id=?", Integer.class, id)).isEqualTo(1);
+    }
+
 }

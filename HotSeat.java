@@ -71,6 +71,7 @@ public class HotSeat {
             for(var f:warm) if(f.join().statusCode()!=200) throw new IllegalStateException("Warm-up health failed");
             System.out.println("Warm-up protocols: "+warm.stream().map(f->f.join().version()).distinct().toList());
             var distribution=new ConcurrentSkipListMap<String,AtomicInteger>();
+            var samples=new ConcurrentSkipListMap<Integer,String>();
             AtomicInteger confirmed=new AtomicInteger(),declined=new AtomicInteger(),errors=new AtomicInteger();
             var done=new ArrayList<CompletableFuture<Void>>();
             long start=System.nanoTime();
@@ -80,7 +81,11 @@ public class HotSeat {
                     outcome="network_error "+cause.getClass().getSimpleName()+": "+Objects.toString(cause.getMessage(), "no detail");}
                 else if(response.statusCode()==201 && response.body().contains("\"confirmed\"")){confirmed.incrementAndGet();outcome="201 confirmed";}
                 else if(response.statusCode()==409 && response.body().contains("\"seat_taken\"")){declined.incrementAndGet();outcome="409 seat_taken";}
-                else{errors.incrementAndGet();outcome="HTTP "+response.statusCode()+" unexpected";}
+                else{errors.incrementAndGet();outcome="HTTP "+response.statusCode()+" unexpected";
+                    samples.computeIfAbsent(response.statusCode(), code -> "headers=" + response.headers().map().entrySet().stream()
+                            .filter(e -> Set.of("server", "content-type", "cf-ray", "retry-after").contains(e.getKey())).toList()
+                            + " body=" + response.body().replaceAll("\\s+", " ").substring(0,Math.min(600,response.body().replaceAll("\\s+", " ").length())));
+                }
                 distribution.computeIfAbsent(outcome,k->new AtomicInteger()).incrementAndGet();return null;
             }));
             double submission=(System.nanoTime()-start)/1e9;
@@ -89,6 +94,7 @@ public class HotSeat {
             var state=clients[0].send(request(base,"/shows/"+show,null,null,null),HttpResponse.BodyHandlers.ofString());
             System.out.printf("submission_span_seconds=%.3f completion_seconds=%.3f%n",submission,elapsed);
             distribution.forEach((outcome,n)->System.out.println(outcome+" = "+n));
+            samples.forEach((code,sample)->System.out.println("sample_http_"+code+" "+sample));
             System.out.println("final_state="+state.body());
             boolean inventory=state.statusCode()==200
                     && Pattern.compile("\"available\"\\s*:\\s*0").matcher(state.body()).find()

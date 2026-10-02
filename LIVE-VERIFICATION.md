@@ -36,7 +36,7 @@ Each of five hot seats had exactly one 201. Maximum held by any user was 4, incl
 
 Phase 2 tested 200 victims: attacker cancellation returned 404; both owner cancellations returned 200 cancelled; spoofed bodies did not change token-derived identity; freed seats had at most one new winner. 183 victims were rebooked during the cancellation race and the remaining 17 were guaranteed rebooked afterward. Final confirmed inventory returned to 4,110, with zero phase-2 5xx.
 
-The generator included the existing local HTTP/2 client-sharding change in Burst.java; this pre-existing user edit is not part of the verification commit. This test differs from the dashboard's 32-client loopback test and from the exact 20,000-buyer single-seat storm. It verifies 20,000 total requests at 1,000 concurrency, not 20,000 simultaneous arrivals.
+The generator included the HTTP/2 client-sharding change in Burst.java; that transport fix is now committed as `d68ed24` so a clean checkout includes it. This test differs from the dashboard's 32-client loopback test and from the exact 20,000-buyer single-seat storm. It verifies 20,000 total requests at 1,000 concurrency, not 20,000 simultaneous arrivals.
 
 ## Conclusion
 
