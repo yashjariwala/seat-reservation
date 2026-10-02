@@ -14,7 +14,7 @@ import java.util.*;
  * can wait on each other in a cycle:
  *   0. fast decline: unlocked read; if a seat is already gone, 409 without locking
  *   1. idempotency: INSERT ... ON CONFLICT (user_id, idem_key) DO NOTHING
- *   2. per-user limit: UPDATE user_counts ... WHERE seat_count + n <= limit
+ *   2. per-user limit: guarded INSERT ... ON CONFLICT DO UPDATE on user_counts
  *   3. seats: lock rows ORDER BY label, then UPDATE ... WHERE status = 'available'
  * Any decline throws ApiError -> the whole transaction rolls back (all-or-nothing).
  */
@@ -52,44 +52,44 @@ public class ReservationController {
         List<String> seats = req.seats().stream().distinct().sorted().toList();
         if (seats.size() != req.seats().size()) throw ApiError.badRequest("seats must be unique");
 
-        var show = db.queryForList("SELECT price_paise, per_user_limit FROM shows WHERE id = ?", showId);
+        // Metadata and requested seat state share one snapshot and one database round trip.
+        Object[] labels = seats.toArray();
+        var show = db.query(con -> {
+            var ps = con.prepareStatement("""
+                    SELECT s.price_paise, s.per_user_limit, count(t.label) AS matched,
+                           count(t.label) FILTER (WHERE t.status = 'available') AS available
+                    FROM shows s LEFT JOIN seats t ON t.show_id = s.id AND t.label = ANY(?)
+                    WHERE s.id = ? GROUP BY s.id""");
+            ps.setArray(1, con.createArrayOf("text", labels));
+            ps.setObject(2, showId);
+            return ps;
+        }, (rs, i) -> new long[]{rs.getLong("price_paise"), rs.getInt("per_user_limit"),
+                rs.getInt("matched"), rs.getInt("available")});
         if (show.isEmpty()) throw ApiError.notFound("show not found");
-        int limit = ((Number) show.get(0).get("per_user_limit")).intValue();
+        long[] state = show.get(0);
+        int limit = (int) state[1];
         if (seats.size() > limit) throw decline("per_user_limit", "would exceed per-user limit of " + limit);
         long amount;
-        try {
-            amount = Math.multiplyExact(((Number) show.get(0).get("price_paise")).longValue(), seats.size());
-        } catch (ArithmeticException e) {
-            throw ApiError.badRequest("amount overflows");
-        }
+        try { amount = Math.multiplyExact(state[0], seats.size()); }
+        catch (ArithmeticException e) { throw ApiError.badRequest("amount overflows"); }
+        if (state[2] != seats.size()) throw ApiError.badRequest("unknown seats for this show");
 
-        // Fast path: decline without taking any lock if a seat is already gone. Safe because a stale
-        // read can only cause a decline, never a sale — the locked gates below stay the sole authority.
-        // Seats are read BEFORE the key: if a same-key twin just took these seats, its committed row is
-        // then guaranteed visible below, so a retry still gets its original reservation, not a 409.
-        Object[] labels = seats.toArray();
-        int[] avail = db.query(con -> {
-            var ps = con.prepareStatement("""
-                    SELECT count(*), count(*) FILTER (WHERE status = 'available')
-                    FROM seats WHERE show_id = ? AND label = ANY(?)""");
-            ps.setObject(1, showId);
-            ps.setArray(2, con.createArrayOf("text", labels));
-            return ps;
-        }, (rs, i) -> new int[]{rs.getInt(1), rs.getInt(2)}).get(0);
-        if (avail[0] != seats.size()) throw ApiError.badRequest("unknown seats for this show");
-        if (avail[1] < seats.size()) {
+        // Read seats BEFORE the key: a committed twin's reservation is visible to the replay query.
+        // This is only a fast decline; locked conditional updates below remain the sale authority.
+        if (state[3] < seats.size()) {
             var prior = db.queryForList("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key);
             if (!prior.isEmpty()) return replay(prior.get(0), showId, seats);
             throw decline("seat_taken", "one or more seats are no longer available");
         }
 
+        // The confirmed row is invisible until commit; any later decline rolls it back with the seats.
         // Gate 1: idempotency. A concurrent request with the same key blocks on the unique
         // index until this transaction commits (then sees our row) or rolls back (then wins).
         UUID id = UUID.randomUUID();
         int inserted = db.update(con -> {
             var ps = con.prepareStatement("""
                     INSERT INTO reservations (id, show_id, user_id, idem_key, seats, amount_paise, status)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                    VALUES (?, ?, ?, ?, ?, ?, 'confirmed')
                     ON CONFLICT (user_id, idem_key) DO NOTHING""");
             ps.setObject(1, id);
             ps.setObject(2, showId);
@@ -102,12 +102,14 @@ public class ReservationController {
         if (inserted == 0)
             return replay(db.queryForMap("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key), showId, seats);
 
-        // Gate 2: per-user limit, checked and incremented in one statement.
-        db.update("INSERT INTO user_counts (show_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING", showId, userId);
+        // Gate 2: atomically initialize OR increment the user counter, with the same limit guard.
+        // New users are safe because the request size was checked against the limit above.
         int counted = db.update("""
-                UPDATE user_counts SET seat_count = seat_count + ?
-                WHERE show_id = ? AND user_id = ? AND seat_count + ? <= ?""",
-                seats.size(), showId, userId, seats.size(), limit);
+                INSERT INTO user_counts (show_id, user_id, seat_count) VALUES (?, ?, ?)
+                ON CONFLICT (show_id, user_id) DO UPDATE
+                SET seat_count = user_counts.seat_count + EXCLUDED.seat_count
+                WHERE user_counts.seat_count + EXCLUDED.seat_count <= ?""",
+                showId, userId, seats.size(), limit);
         if (counted == 0) throw decline("per_user_limit", "would exceed per-user limit of " + limit);
 
         // Gate 3: lock the requested seats in label order (deadlock-free), then flip only available ones.
@@ -130,7 +132,6 @@ public class ReservationController {
         });
         if (taken != seats.size()) throw decline("seat_taken", "one or more seats are no longer available");
 
-        db.update("UPDATE reservations SET status = 'confirmed' WHERE id = ?", id);
         obs.confirmed();
         return ResponseEntity.status(201).body(new Reservation(id, showId, userId, seats, amount, "confirmed"));
     }

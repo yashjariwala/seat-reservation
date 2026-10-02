@@ -17,11 +17,14 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
 import org.springframework.web.filter.OncePerRequestFilter;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /** Metrics + request-scoped structured logging. */
@@ -32,27 +35,29 @@ public class Obs extends OncePerRequestFilter {
 
     private final MeterRegistry registry;
     private final JdbcTemplate db;
-    private final MultiGauge seats;
-    private final MultiGauge seatsTotal;
-    // MultiGauge overwrites unregister/re-register rows. Prevent Prometheus from scraping midway
-    // through that operation (Micrometer issue #6851), and publish both families together.
+    private final Counter confirmations;
+    private final Map<String, Counter> declines = new ConcurrentHashMap<>();
+    private final Set<String> registeredShows = new HashSet<>(); // guarded by metricSnapshotLock
+    private volatile Map<String, Map<String, Long>> seatSnapshot = Map.of();
+    // Publish all seat counts together and keep a scrape on one consistent snapshot.
     private final ReentrantReadWriteLock metricSnapshotLock = new ReentrantReadWriteLock(true);
 
     Obs(MeterRegistry registry, JdbcTemplate db) {
         this.registry = registry;
         this.db = db;
-        this.seats = MultiGauge.builder("seats").description("Seats per show by status").register(registry);
-        this.seatsTotal = MultiGauge.builder("seats_declared").description("Seats declared at show creation").register(registry);
+        this.confirmations = registry.counter("reservations_confirmed_total");
+        for (String reason : List.of("seat_taken", "per_user_limit", "idempotent_replay", "idempotency_key_reused"))
+            declines.put(reason, registry.counter("reservations_declined_total", "reason", reason));
     }
 
     void confirmed() {
-        afterCommit(() -> registry.counter("reservations_confirmed_total").increment());
+        afterCommit(confirmations::increment);
         MDC.put("outcome", "confirmed");
     }
 
     /** reason: seat_taken | per_user_limit | idempotent_replay | idempotency_key_reused | ... */
     void declined(String reason) {
-        registry.counter("reservations_declined_total", "reason", reason).increment();
+        declines.computeIfAbsent(reason, r -> registry.counter("reservations_declined_total", "reason", r)).increment();
         MDC.put("outcome", reason);
     }
 
@@ -67,27 +72,37 @@ public class Obs extends OncePerRequestFilter {
     /** seats{show_id, status} + seats_declared{show_id}: their sum must match (reconciliation). ponytail: 1s lag; fine for watching a burst. */
     @Scheduled(fixedDelay = 1000)
     void refreshSeatGauges() {
-        List<MultiGauge.Row<?>> rows = new ArrayList<>();
-        Map<String, Long> declared = new LinkedHashMap<>();
+        Map<String, Map<String, Long>> next = new LinkedHashMap<>();
         // One SQL snapshot avoids comparing old seat counts with a newly-created show's total.
         db.query("""
                 SELECT s.id AS show_id, s.total_seats, t.status, count(t.label) AS n
                 FROM shows s LEFT JOIN seats t ON t.show_id = s.id
                 GROUP BY s.id, s.total_seats, t.status""", rs -> {
-            String showId = rs.getString("show_id");
-            declared.put(showId, rs.getLong("total_seats"));
+            Map<String, Long> counts = next.computeIfAbsent(rs.getString("show_id"), id ->
+                    new HashMap<>(Map.of("available", 0L, "held", 0L, "confirmed", 0L)));
+            counts.put("total", rs.getLong("total_seats"));
             String status = rs.getString("status");
-            if (status != null) rows.add(MultiGauge.Row.of(Tags.of("show_id", showId, "status", status), rs.getLong("n")));
+            if (status != null) counts.put(status, rs.getLong("n"));
         });
-        List<MultiGauge.Row<?>> totals = new ArrayList<>();
-        declared.forEach((id, total) -> totals.add(MultiGauge.Row.of(Tags.of("show_id", id), total)));
+        next.replaceAll((id, counts) -> Map.copyOf(counts));
         metricSnapshotLock.writeLock().lock();
         try {
-            seats.register(rows, true);
-            seatsTotal.register(totals, true);
+            seatSnapshot = Map.copyOf(next);
+            // Register each series once; subsequent refreshes only replace the snapshot it reads.
+            for (String id : next.keySet()) if (registeredShows.add(id)) {
+                for (String status : List.of("available", "held", "confirmed"))
+                    Gauge.builder("seats", this, obs -> obs.seatValue(id, status))
+                            .tags("show_id", id, "status", status).register(registry);
+                Gauge.builder("seats_declared", this, obs -> obs.seatValue(id, "total"))
+                        .tag("show_id", id).register(registry);
+            }
         } finally {
             metricSnapshotLock.writeLock().unlock();
         }
+    }
+
+    private long seatValue(String showId, String status) {
+        return seatSnapshot.getOrDefault(showId, Map.of()).getOrDefault(status, 0L);
     }
 
     /** Correlation id: honour inbound X-Request-Id or mint one; echo it back; one access log line per request. */

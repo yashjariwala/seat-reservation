@@ -19,6 +19,31 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class ObsTest {
+    @Test void gaugesKeepTheirIdentityAndMissingStatusesBecomeZero() throws Exception {
+        JdbcTemplate db = mock(JdbcTemplate.class);
+        ResultSet row = mock(ResultSet.class);
+        java.util.concurrent.atomic.AtomicBoolean sold = new java.util.concurrent.atomic.AtomicBoolean();
+        when(row.getString("show_id")).thenReturn("show1");
+        when(row.getString("status")).thenAnswer(i -> sold.get() ? "confirmed" : "available");
+        when(row.getLong("n")).thenReturn(100L);
+        when(row.getLong("total_seats")).thenReturn(100L);
+        doAnswer(i -> { ((RowCallbackHandler)i.getArgument(1)).processRow(row); return null; })
+                .when(db).query(anyString(), any(RowCallbackHandler.class));
+        PrometheusMeterRegistry registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+        try {
+            Obs obs = new Obs(registry, db);
+            obs.refreshSeatGauges();
+            var available = registry.get("seats").tags("show_id", "show1", "status", "available").gauge();
+            int meters = registry.getMeters().size();
+            assertThat(available.value()).isEqualTo(100);
+            sold.set(true); obs.refreshSeatGauges();
+            assertThat(registry.get("seats").tags("show_id", "show1", "status", "available").gauge()).isSameAs(available);
+            assertThat(available.value()).isZero();
+            assertThat(registry.get("seats").tags("show_id", "show1", "status", "confirmed").gauge().value()).isEqualTo(100);
+            assertThat(registry.getMeters()).hasSize(meters);
+        } finally { registry.close(); }
+    }
+
     @Test void refreshWaitsForScrapeAndConcurrentScrapesNeverSeeDuplicateLabels() throws Exception {
         JdbcTemplate db = mock(JdbcTemplate.class);
         ResultSet row = mock(ResultSet.class);

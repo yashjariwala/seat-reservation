@@ -94,6 +94,17 @@ curl -s -XPOST $B/shows/$SHOW/reserve -H "Authorization: Bearer $TOKEN" -H 'cont
   - `http_server_requests_seconds_count{status}` — 5xx rate
 - Logs: one JSON line per request with `request_id` (inbound `X-Request-Id` honoured, echoed back), `user_id`, `outcome`, `status`, `duration_ms`.
 
+## Regression tests
+
+`./mvnw test` runs the runner admission/cooldown and concurrent metric scrape tests. PostgreSQL concurrency tests require a dedicated test database:
+
+```bash
+createdb seat_tests
+SEAT_TEST_DATABASE_URL=jdbc:postgresql://localhost:5432/seat_tests ./mvnw test
+```
+
+These tests check simultaneous initialization of a user's counter, limit declines rolling back reservation rows, multi-seat races rolling back losing counters, and concurrent idempotent replays. They create isolated shows in the supplied database; use a test database rather than the deployed database.
+
 ## Deploy (Render + Neon, both free)
 
 1. Neon: create a project → copy host, database, user, password.
