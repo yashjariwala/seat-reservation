@@ -5,7 +5,11 @@ services:
     runtime: docker
     plan: free
     region: singapore   # same region as the Neon DB (AWS ap-southeast-1)
-    healthCheckPath: /actuator/health/readiness
+    # No platform health check, deliberately. Render gives a check 5s, stops routing after 15s of failures and
+    # restarts after 60s. On 0.1 CPU a burst queues every request (health checks too) for >5s, so Render would
+    # cut off and restart a busy-but-correct instance. With one instance there is nowhere else to route, so
+    # eviction can only turn load into an outage. A dead process is still restarted. /actuator/health/liveness
+    # and /readiness (fails closed on DB loss) remain for monitoring.
     envVars:
       - key: DATABASE_URL        # jdbc:postgresql://<neon-host>/<db>?sslmode=require
         sync: false
