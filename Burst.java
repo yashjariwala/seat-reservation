@@ -80,7 +80,7 @@ public class Burst {
         System.out.printf("minting %d tokens...%n", users.size());
         runAll(users.stream().map(u -> (Callable<Object>) () -> {
             for (int attempt = 1; ; attempt++) {   // setup, not the test: retry transient edge errors
-                HttpResponse<String> r = send("POST", "/auth/token", "{\"user_id\":\"" + u + "\"}", Map.of());
+                HttpResponse<String> r = send("POST", "/auth/token", "{\"user_id\":\"" + u + "\"}", Map.of("X-Admin-Key", adminKey));
                 if (r.statusCode() == 200) { tokens.put(u, field(r.body(), "token")); return null; }
                 if (attempt == 5) throw new IllegalStateException("token mint failed: " + r.statusCode() + " " + r.body());
                 Thread.sleep(500L * attempt);

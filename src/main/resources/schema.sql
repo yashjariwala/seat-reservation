@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS seats (
     PRIMARY KEY (show_id, label)
 );
 
+-- Cancel frees seats WHERE reservation_id = ?; without this it scans the show's seats.
+CREATE INDEX IF NOT EXISTS seats_reservation_id ON seats (reservation_id) WHERE reservation_id IS NOT NULL;
+
 -- UNIQUE(user_id, idem_key) is the exactly-once guarantee for retries.
 CREATE TABLE IF NOT EXISTS reservations (
     id           UUID PRIMARY KEY,

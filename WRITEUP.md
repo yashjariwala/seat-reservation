@@ -20,7 +20,7 @@ Every reserve is one Postgres transaction (READ COMMITTED) that passes three gat
 
 - **Stored in:** the `reservations` row itself — `UNIQUE (user_id, idem_key)` plus a `request_hash` (show id + sorted seat list). Keys are per user, so one user can never collide with another's key.
 - **Exactly once:** a concurrent retry's `INSERT` blocks on the unique index until the first transaction finishes. If the first committed, the retry hits the conflict, reads the stored row and returns it (200, `idempotent_replay`). If the first rolled back, the retry proceeds as a fresh request.
-- **Same key, different body:** the hash differs ⇒ 409 `idempotency_key_reused`.
+- **Same key, different body:** the hash differs ⇒ 409 `idempotency_key_reused`. The hash length-prefixes each label (`["A","B"]` → `1:A1:B`, `["A,B"]` → `3:A,B`) so two different seat lists can never collide.
 - **Declines don't burn the key:** a declined request rolls back its reservation row, so retrying the same key re-evaluates rather than replaying a 409. Nothing was charged, so this is safe.
 
 ## Holds & expiry

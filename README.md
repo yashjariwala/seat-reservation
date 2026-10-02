@@ -42,7 +42,7 @@ All money is integer paise. JSON field names are snake_case.
 
 | Method | Path | Auth | Notes |
 |---|---|---|---|
-| POST | `/auth/token` | — | `{"user_id":"alice"}` → `{"token":...}` (demo login) |
+| POST | `/auth/token` | `X-Admin-Key` | `{"user_id":"alice"}` → `{"token":...}` (stands in for an identity provider; users can't mint each other's tokens) |
 | POST | `/shows` | `X-Admin-Key` | `{"name","seats":[...],"price_paise","per_user_limit"?}` → 201 |
 | GET | `/shows/{id}` | — | per-seat status + `counts` + `total_seats` |
 | POST | `/shows/{id}/reserve` | `Bearer` | `{"seats":[...],"idempotency_key"}` (or `Idempotency-Key` header) |
@@ -63,7 +63,7 @@ Reserve outcomes:
 B=http://localhost:8080
 SHOW=$(curl -s -XPOST $B/shows -H 'X-Admin-Key: dev-admin-key' -H 'content-type: application/json' \
   -d '{"name":"friday-night","seats":["A1","A2","A3"],"price_paise":25000}' | jq -r .id)
-TOKEN=$(curl -s -XPOST $B/auth/token -H 'content-type: application/json' -d '{"user_id":"alice"}' | jq -r .token)
+TOKEN=$(curl -s -XPOST $B/auth/token -H 'X-Admin-Key: dev-admin-key' -H 'content-type: application/json' -d '{"user_id":"alice"}' | jq -r .token)
 curl -s -XPOST $B/shows/$SHOW/reserve -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"seats":["A1"],"idempotency_key":"k-1"}'
 ```

@@ -7,6 +7,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.sql.Array;
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Reserve = one transaction through three atomic gates, always locked in this order
@@ -48,14 +49,22 @@ public class ReservationController {
         String key = keyHeader != null ? keyHeader : req.idempotencyKey();
         if (key == null || key.isBlank() || key.length() > 128) throw ApiError.badRequest("idempotency_key is required (max 128 chars)");
         if (req.seats() == null || req.seats().isEmpty()) throw ApiError.badRequest("seats must be non-empty");
+        if (req.seats().stream().anyMatch(s -> s == null || s.isBlank())) throw ApiError.badRequest("seat labels must be non-blank");
         List<String> seats = req.seats().stream().distinct().sorted().toList();
         if (seats.size() != req.seats().size()) throw ApiError.badRequest("seats must be unique");
-        String requestHash = showId + ":" + String.join(",", seats);
+        // Length-prefixed so it is unambiguous: ["A","B"] -> "1:A1:B", ["A,B"] -> "3:A,B".
+        String requestHash = showId + ":" + seats.stream().map(l -> l.length() + ":" + l).collect(Collectors.joining());
 
         var show = db.queryForList("SELECT price_paise, per_user_limit FROM shows WHERE id = ?", showId);
         if (show.isEmpty()) throw ApiError.notFound("show not found");
-        long amount = ((Number) show.get(0).get("price_paise")).longValue() * seats.size();
         int limit = ((Number) show.get(0).get("per_user_limit")).intValue();
+        if (seats.size() > limit) throw decline("per_user_limit", "would exceed per-user limit of " + limit);
+        long amount;
+        try {
+            amount = Math.multiplyExact(((Number) show.get(0).get("price_paise")).longValue(), seats.size());
+        } catch (ArithmeticException e) {
+            throw ApiError.badRequest("amount overflows");
+        }
 
         // Fast path: decline without taking any lock if a seat is already gone. Safe because a stale
         // read can only cause a decline, never a sale — the locked gates below stay the sole authority.

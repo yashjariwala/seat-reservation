@@ -20,9 +20,14 @@ public class ShowController {
     record TokenRequest(String userId) {}
     record CreateShow(String name, List<String> seats, Long pricePaise, Integer perUserLimit) {}
 
-    /** Demo login: issues a signed token for a user id. */
+    /**
+     * Issues a signed token for a user id. Admin-only: this stands in for an identity provider, so a user
+     * cannot mint a token for someone else and act as them.
+     */
     @PostMapping("/auth/token")
-    Map<String, String> token(@RequestBody TokenRequest req) {
+    Map<String, String> token(@RequestHeader(value = "X-Admin-Key", required = false) String adminKey,
+                              @RequestBody TokenRequest req) {
+        auth.requireAdmin(adminKey);
         return Map.of("user_id", req.userId(), "token", auth.issue(req.userId()));
     }
 
