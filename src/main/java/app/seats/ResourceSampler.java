@@ -90,8 +90,10 @@ public class ResourceSampler {
             event.addKeyValue("http_worker_metrics_available", httpWorker != null);
             if (httpWorker != null) {
                 event.addKeyValue("http_worker_queue", httpWorker.getWorkerQueueSize())
-                        .addKeyValue("http_workers_busy", httpWorker.getBusyWorkerThreadCount())
                         .addKeyValue("http_workers_max", httpWorker.getMaxWorkerPoolSize());
+                int busy = httpWorker.getBusyWorkerThreadCount();
+                event.addKeyValue("http_busy_workers_available", busy >= 0);
+                if (busy >= 0) event.addKeyValue("http_workers_busy", busy);
             }
             Map<String, Long> throttle = cpuThrottle();
             event.addKeyValue("cpu_throttle_metrics_available", !throttle.isEmpty());
