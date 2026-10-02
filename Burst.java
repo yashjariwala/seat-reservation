@@ -101,7 +101,7 @@ public class Burst {
         List<Res> results = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger netErrors = new AtomicInteger();
         runAll(reqs.stream().map(r -> (Callable<Object>) () -> {
-            String body = "{\"idempotency_key\":\"" + r.key() + "\",\"seats\":["
+            String body = "{\"idempotency_key\":\"" + show.substring(0, 8) + "-" + r.key() + "\",\"seats\":["
                     + r.seats().stream().map(s -> "\"" + s + "\"").collect(Collectors.joining(",")) + "]}";
             try {
                 HttpResponse<String> resp = send("POST", "/shows/" + show + "/reserve", body,
