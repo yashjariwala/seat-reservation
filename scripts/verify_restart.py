@@ -102,7 +102,7 @@ try:
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as worker:
         request = worker.submit(api, "/shows/" + show_id + "/reserve", payload, headers)
         until(lambda: sql("SELECT count(*) FROM pg_stat_activity WHERE datname='" + DATABASE
-              + "' AND wait_event='PgSleep' AND query LIKE '%UPDATE seats SET status%'") == "1", 10)
+              + "' AND wait_event='PgSleep' AND query LIKE '%reserve_booking%'") == "1", 10)
         # The seat UPDATE has run inside the transaction, but none of its rows are visible yet.
         assert sql("SELECT count(*) FROM reservations") == "0"
         assert sql("SELECT count(*) FROM user_counts") == "0"

@@ -108,3 +108,17 @@ This is local correctness/recovery evidence, separate from the failed public sim
 Three reproduced defects were fixed and regression-tested: unhandled failures were logged as 200 before the container generated their 500 response; a persisted key with changed seats could return 400 during seat/amount validation rather than 409; and trailing empty token segments were ignored by Java's default string splitting. The token issue accepted an alternate spelling of the same valid token, not a forged identity. Committed responses retain their actual logged status even when subsequent I/O fails.
 
 Fault-injection 500s are intentional tests of rollback, not evidence of passing the assignment's zero-5xx public burst. These checks strengthen confidence in specific properties but are not a proof of absence of all possible bugs. The full public acceptance bar remains unmet.
+
+## Server-side booking gates follow-up
+
+The three mutation gates now run in `public.reserve_booking`, invoked as one prepared statement after the batched preflight. The Java transaction still owns commit/rollback, and confirmation metrics remain deferred until commit. Sorted locks, conditional seat updates and the per-user unique key are preserved. Private domain exceptions roll back the function's partial changes; other failures propagate.
+
+Validation: all 19 final tests passed with local PostgreSQL and fault injection enabled. The expanded 25-seed/400-step model run passed 10,000 operations. The new direct-function test verified that partial seat updates, unknown seats and limit declines leave no extra reservation/counter/ownership even with an autocommit caller. All four process-crash/cold-start recovery checks passed.
+
+| Paired 20,000-request run, 128 concurrency | Before reservation seconds | After reservation seconds | Before full-test CPU seconds | After full-test CPU seconds |
+|---|---|---|---|---|
+| 1 | 21.0 | 11.0 | 15.490 | 10.113 |
+| 2 | 20.7 | 11.2 | 12.283 | 9.214 |
+| 3 | 21.0 | 11.7 | 13.234 | 9.800 |
+
+All six runs passed the full generator checks, including cancellation/identity/rebooking. Each used a fresh 5,000-seat show and the same injected 8 ms delay per PostgreSQL ReadyForQuery message. Median reservation time improved 46.7%; median full-test process CPU improved 25.9%. The measurement used unrestricted local CPU, not Render's 0.1 CPU quota.

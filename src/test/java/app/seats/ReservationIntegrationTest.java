@@ -33,6 +33,7 @@ class ReservationIntegrationTest {
     @Autowired Auth auth;
     @Autowired JdbcTemplate db;
     @Autowired MeterRegistry meters;
+    @Autowired BookingDatabase bookings;
     @LocalServerPort int port;
     @Value("${ADMIN_KEY:dev-admin-key}") String admin;
 
@@ -49,6 +50,27 @@ class ReservationIntegrationTest {
         HttpHeaders headers = new HttpHeaders(); headers.setBearerAuth(token);
         return http.postForEntity("/reservations/" + id + "/cancel",
                 new HttpEntity<>(Map.of(), headers), JsonNode.class);
+    }
+
+    @Test void functionDeclinesRollbackPartialChangesEvenWithoutAnOuterRollback() {
+        UUID id = show(List.of("A", "B"));
+        String owner = "function-owner-" + UUID.randomUUID();
+        assertThat(reserve(id, auth.issue(owner), "winner", List.of("A")).getStatusCode().value()).isEqualTo(201);
+        // Direct DAO calls use autocommit here: only the function can undo its partial writes.
+        var taken = bookings.book(id, "function-loser", "partial", List.of("A", "B"), 50000, 4);
+        assertThat(taken.outcome()).isEqualTo("seat_taken");
+        assertThat(taken.reservation()).isNull();
+        var unknown = bookings.book(id, owner, "unknown", List.of("B", "missing"), 50000, 4);
+        assertThat(unknown.outcome()).isEqualTo("unknown_seats");
+        assertThat(db.queryForObject("SELECT count(*) FROM reservations WHERE show_id=?", Integer.class, id)).isEqualTo(1);
+        assertThat(db.queryForObject("SELECT count(*) FROM user_counts WHERE show_id=?", Integer.class, id)).isEqualTo(1);
+        DatabaseInvariantAudit.assertConsistent(db, id);
+
+        UUID limited = show(List.of("A", "B", "C", "D", "E"));
+        assertThat(reserve(limited, auth.issue(owner), "full", List.of("A", "B", "C", "D")).getStatusCode().value()).isEqualTo(201);
+        assertThat(bookings.book(limited, owner, "fifth", List.of("E"), 25000, 4).outcome()).isEqualTo("per_user_limit");
+        assertThat(db.queryForObject("SELECT count(*) FROM reservations WHERE show_id=?", Integer.class, limited)).isEqualTo(1);
+        DatabaseInvariantAudit.assertConsistent(db, limited);
     }
 
     @Test void invariantAuditDetectsDirectDatabaseCorruption() {
@@ -262,7 +284,7 @@ class ReservationIntegrationTest {
     private int pausedBackend() {
         var ids = db.queryForList("""
                 SELECT pid FROM pg_stat_activity WHERE datname=current_database()
-                AND wait_event='PgSleep' AND query LIKE '%UPDATE seats SET status%'
+                AND wait_event='PgSleep' AND query LIKE '%reserve_booking%'
                 """, Integer.class);
         return ids.isEmpty() ? -1 : ids.get(0);
     }
