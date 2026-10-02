@@ -4,6 +4,7 @@ services:
     name: seat-reservation
     runtime: docker
     plan: free
+    region: singapore   # same region as the Neon DB (AWS ap-southeast-1)
     healthCheckPath: /actuator/health/readiness
     envVars:
       - key: DATABASE_URL        # jdbc:postgresql://<neon-host>/<db>?sslmode=require
