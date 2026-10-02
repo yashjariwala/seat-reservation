@@ -8,6 +8,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
+import org.springframework.context.event.EventListener;
+import org.springframework.boot.web.context.WebServerInitializedEvent;
+import org.springframework.boot.web.embedded.undertow.UndertowWebServer;
+import org.xnio.management.XnioWorkerMXBean;
 
 import javax.sql.DataSource;
 import java.lang.management.BufferPoolMXBean;
@@ -15,6 +19,8 @@ import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.UUID;
+import java.util.Map;
+import java.util.HashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -34,6 +40,14 @@ public class ResourceSampler {
     });
     private long previousNanos = System.nanoTime();
     private long previousCpu = cpuTime();
+    private volatile XnioWorkerMXBean worker;
+    private Map<String, Long> previousThrottle = Map.of();
+
+    @EventListener void serverStarted(WebServerInitializedEvent event) {
+        if (event.getWebServer() instanceof UndertowWebServer server) {
+            worker = server.getUndertow().getWorker().getMXBean();
+        }
+    }
 
     ResourceSampler(DataSource dataSource, @Value("${resource.sample.interval-ms:5000}") long interval) {
         this.dataSource = dataSource;
@@ -72,6 +86,21 @@ public class ResourceSampler {
             }
             Long containerMemory = containerMemory();
             if (containerMemory != null) event.addKeyValue("container_memory_bytes", containerMemory);
+            var httpWorker = worker;
+            event.addKeyValue("http_worker_metrics_available", httpWorker != null);
+            if (httpWorker != null) {
+                event.addKeyValue("http_worker_queue", httpWorker.getWorkerQueueSize())
+                        .addKeyValue("http_workers_busy", httpWorker.getBusyWorkerThreadCount())
+                        .addKeyValue("http_workers_max", httpWorker.getMaxWorkerPoolSize());
+            }
+            Map<String, Long> throttle = cpuThrottle();
+            event.addKeyValue("cpu_throttle_metrics_available", !throttle.isEmpty());
+            throttle.forEach((key, value) -> {
+                event.addKeyValue(key + "_total", value);
+                Long before = previousThrottle.get(key);
+                if (before != null && value >= before) event.addKeyValue(key + "_delta", value - before);
+            });
+            previousThrottle = throttle;
             if (dataSource instanceof HikariDataSource hikari && hikari.getHikariPoolMXBean() != null) {
                 var pool = hikari.getHikariPoolMXBean();
                 event.addKeyValue("db_active", pool.getActiveConnections())
@@ -101,5 +130,34 @@ public class ResourceSampler {
             }
         }
         return null;
+    }
+
+    private static Map<String, Long> cpuThrottle() {
+        for (String file : new String[]{"/sys/fs/cgroup/cpu.stat", "/sys/fs/cgroup/cpu/cpu.stat",
+                "/sys/fs/cgroup/cpu,cpuacct/cpu.stat"}) {
+            try {
+                Map<String, Long> result = parseCpuStat(Files.readString(Path.of(file)));
+                if (!result.isEmpty()) return result;
+            } catch (Exception ignored) {
+                // Counters may be unavailable on macOS or restricted container mounts.
+            }
+        }
+        return Map.of();
+    }
+
+    static Map<String, Long> parseCpuStat(String text) {
+        Map<String, Long> result = new HashMap<>();
+        for (String line : text.split("\\R")) {
+            String[] fields = line.trim().split("\\s+");
+            if (fields.length != 2) continue;
+            switch (fields[0]) {
+                case "nr_periods" -> result.put("cpu_periods", Long.parseLong(fields[1]));
+                case "nr_throttled" -> result.put("cpu_throttled_periods", Long.parseLong(fields[1]));
+                case "throttled_usec" -> result.put("cpu_throttled_usec", Long.parseLong(fields[1]));
+                case "throttled_time" -> result.put("cpu_throttled_usec", Long.parseLong(fields[1]) / 1000);
+                default -> { }
+            }
+        }
+        return result;
     }
 }
