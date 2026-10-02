@@ -41,3 +41,18 @@ The generator included the HTTP/2 client-sharding change in Burst.java; that tra
 ## Conclusion
 
 The exact 500-contender requirement is verified on the public URL. The complete 20,000-concurrent-buyer objective is **not achieved** on the current free deployment. Keeping hosting free is a user constraint. Lowering concurrency or recovering failed requests with retries does not turn the failed exact storm into a pass.
+
+## Follow-up: autocommit decline patch (`3eee3ff`)
+
+Already-unavailable seats now return 409 from one autocommit snapshot query. Potential winners still use the atomic reservation transaction; database state remains authoritative. Eight automated tests passed, including concurrent idempotency and cancellation replay against PostgreSQL.
+
+With an injected 8 ms database network delay, three comparable 2,000-request runs had median duration 8.750 s before and 5.367 s after (38.7% lower). All correctness checks passed in all six runs. This controlled result is not a prediction of Render throughput.
+
+| Exact buyers | Submission span | Completion | 201 | 409 | 429 | 502 | 520 | Transport failures | Result |
+|---|---|---|---|---|---|---|---|---|---|
+| 500 | 0.013 s | 9.392 s | 1 | 499 | 0 | 0 | 0 | 0 | Pass |
+| 20,000 | 0.105 s | 94.525 s | 1 | 8,733 | 10,685 | 560 | 1 | 20 | Fail |
+
+Both final states contained exactly one confirmed seat. The sampled 429 response contained `Too Many Requests`, `Retry-After: 1`, and Cloudflare headers. Sampled 502/520 responses also had Cloudflare headers. These identify the response path, not the exact throttling policy or its configuration. More requests received clean declines than in the earlier run, but completion was slower; this single comparison does not establish a general live speed improvement. The strict 20,000-at-once objective remains unmet.
+
+The follow-up mixed run used 20,000 requests at 1,000 concurrency and completed in 210.2 s (95 requests/s). Outcomes: 3,596 confirmations, 15,521 seat-taken responses, 267 user-limit declines, 534 replays, 81 key-reuse declines, and one 520 response (`error code: 520`). No network errors occurred. All seat uniqueness, user limits, idempotency, identity, cancellation/rebooking, and 20 inventory reconciliation polls passed. Final inventory was 892 available, 0 held, 4,108 confirmed of 5,000 seats. The run failed two checks: zero 5xx, and seat-taken metric delta 15,522 versus 15,521 received responses. A decline response lost at the edge is consistent with this discrepancy; that causal explanation is an inference. Faster completion than the previous mixed run does not establish reliable zero-error performance.
