@@ -61,6 +61,16 @@ The live bursts taught three things the local runs could not:
 - **Keep-alive must outlive the proxy's.** Tomcat closed each kept-alive connection after 100 requests; a request the proxy sent down a closing connection came back as 520/502 from the edge. Unlimited requests per connection and a 120s idle timeout fixed it.
 - **Memory is the real budget, not threads.** The JVM is capped at a 256MB heap to leave room for metaspace, stacks and socket buffers inside 512MB. Virtual threads were tried and reverted: each waiting connection then holds a Tomcat processor, and 3000 of them exhaust the heap; the 64 platform threads act as a natural bulkhead.
 
+**The 20,000-simultaneous storm is limited by the platform, not the service — and that is measured, not assumed.** Firing 20,000 requests at once at `/actuator/health/liveness`, an endpoint with no database call and no request body, fails the same way the reserve storm does:
+
+| Endpoint | Requests at once | Result |
+|---|---|---|
+| `/actuator/health/liveness` | 2,000 | 2,000 × 200 |
+| `/actuator/health/liveness` | 20,000 | 11,959 × 200, 7,132 × 429, 908 × 502, 1 × 520 |
+| `/shows/{id}/reserve` (one hot seat) | 20,000 | 1 × 201, 8,733 × 409, 10,685 × 429, 560 × 502, 1 × 520 |
+
+The no-op endpoint served about 2.3× more requests per second than reserve (~208/s vs ~92/s) and still lost 40% of the storm to the edge, which answers the excess with 429/502 before it reaches the application. So reservation cost affects throughput, but it is not what fails the test: even a request that costs nothing does not get 20,000 clean answers on a 0.1-CPU instance behind Render's edge. The application's own 5xx count stayed at zero, and correctness held in every run (one winner per seat, no double-sell, reconciliation intact). Passing the full storm needs more capacity than the free tier provides (a larger instance, or a host without a rate-limiting edge); keeping hosting free was a deliberate constraint. Full numbers: [LIVE-VERIFICATION.md](LIVE-VERIFICATION.md).
+
 ## AI usage
 
 > **TODO (Yash): rewrite this section in your own words before submitting.** Facts to start from are below.

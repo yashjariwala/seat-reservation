@@ -56,3 +56,24 @@ With an injected 8 ms database network delay, three comparable 2,000-request run
 Both final states contained exactly one confirmed seat. The sampled 429 response contained `Too Many Requests`, `Retry-After: 1`, and Cloudflare headers. Sampled 502/520 responses also had Cloudflare headers. These identify the response path, not the exact throttling policy or its configuration. More requests received clean declines than in the earlier run, but completion was slower; this single comparison does not establish a general live speed improvement. The strict 20,000-at-once objective remains unmet.
 
 The follow-up mixed run used 20,000 requests at 1,000 concurrency and completed in 210.2 s (95 requests/s). Outcomes: 3,596 confirmations, 15,521 seat-taken responses, 267 user-limit declines, 534 replays, 81 key-reuse declines, and one 520 response (`error code: 520`). No network errors occurred. All seat uniqueness, user limits, idempotency, identity, cancellation/rebooking, and 20 inventory reconciliation polls passed. Final inventory was 892 available, 0 held, 4,108 confirmed of 5,000 seats. The run failed two checks: zero 5xx, and seat-taken metric delta 15,522 versus 15,521 received responses. A decline response lost at the edge is consistent with this discrepancy; that causal explanation is an inference. Faster completion than the previous mixed run does not establish reliable zero-error performance.
+
+## Control experiment: the same storm against a no-op endpoint
+
+Question: is the 20,000-at-once failure caused by reservation cost, or by the platform in front of the application? Control: fire the same storm at `/actuator/health/liveness`, which does no database work and reads no request body.
+
+Method: about 250 HTTP/2 connections (at most 80 streams each, under the edge's per-connection stream cap) were opened and warmed first; then N GETs were issued at once, with no retries. Same public URL, same day.
+
+| Endpoint | Requests at once | Completion | 200 | 429 | 502 | 520 | Served by app |
+|---|---|---|---|---|---|---|---|
+| `/actuator/health/liveness` | 2,000 | 22.6 s | 2,000 | 0 | 0 | 0 | 100% |
+| `/actuator/health/liveness` | 20,000 | 57.4 s | 11,959 | 7,132 | 908 | 1 | 59.8% (~208/s) |
+| `/shows/{id}/reserve`, one hot seat (above, after `3eee3ff`) | 20,000 | 94.5 s | 1 × 201 + 8,733 × 409 | 10,685 | 560 | 1 | 43.7% (~92/s) |
+
+Reading:
+
+- The no-op endpoint fails the 20,000-at-once storm with the same failure classes (Cloudflare-fronted 429/502/520) as the reservation storm. 40.2% of liveness requests never received a 200, although each one costs the application almost nothing.
+- Liveness completed about 2.3× more requests per second than reserve. So reservation cost does matter for throughput, but even at near-zero cost the edge rejects a large share of a 20,000-request instant storm on this instance. Making reserve as cheap as liveness would, at best, bring its failure rate down to the liveness level, not to zero.
+- The application emitted no 5xx series during these runs; the rejections are produced before requests reach it.
+
+Conclusion: on the free deployment (0.1 CPU behind Render's Cloudflare edge), no application or query change can produce 20,000 clean responses to 20,000 simultaneous requests. Closing that gap requires capacity outside the application (a larger instance or a host without a rate-limiting edge), which was kept out of scope by the free-hosting constraint.
+
