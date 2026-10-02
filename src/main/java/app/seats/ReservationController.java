@@ -26,12 +26,14 @@ public class ReservationController {
     private final Auth auth;
     private final Obs obs;
     private final TransactionTemplate transactions;
+    private final PreflightReader preflights;
 
-    ReservationController(JdbcTemplate db, Auth auth, Obs obs, PlatformTransactionManager manager) {
+    ReservationController(JdbcTemplate db, Auth auth, Obs obs, PlatformTransactionManager manager, PreflightReader preflights) {
         this.db = db;
         this.auth = auth;
         this.obs = obs;
         this.transactions = new TransactionTemplate(manager);
+        this.preflights = preflights;
     }
 
     private ApiError decline(String reason, String msg) {
@@ -60,32 +62,8 @@ public class ReservationController {
         // If this snapshot sees unavailable seats from a committed twin, it also sees
         // that twin's reservation. Hot losers need no transaction or rollback round trip.
         Object[] labels = seats.toArray();
-        var show = db.query(con -> {
-            var ps = con.prepareStatement("""
-                    SELECT s.price_paise, s.per_user_limit, count(t.label) AS matched,
-                           count(t.label) FILTER (WHERE t.status = 'available') AS available,
-                           r.id AS prior_id, r.show_id AS prior_show, r.user_id AS prior_user,
-                           r.seats AS prior_seats, r.amount_paise AS prior_amount, r.status AS prior_status
-                    FROM shows s
-                    LEFT JOIN reservations r ON r.user_id = ? AND r.idem_key = ?
-                    LEFT JOIN seats t ON t.show_id = s.id AND t.label = ANY(?)
-                    WHERE s.id = ? GROUP BY s.id, r.id""");
-            ps.setString(1, userId);
-            ps.setString(2, key);
-            ps.setArray(3, con.createArrayOf("text", labels));
-            ps.setObject(4, showId);
-            return ps;
-        }, (rs, i) -> {
-            UUID priorId = (UUID) rs.getObject("prior_id");
-            Reservation prior = priorId == null ? null : new Reservation(priorId,
-                    (UUID) rs.getObject("prior_show"), rs.getString("prior_user"),
-                    List.of((String[]) rs.getArray("prior_seats").getArray()),
-                    rs.getLong("prior_amount"), rs.getString("prior_status"));
-            return new Preflight(rs.getLong("price_paise"), rs.getInt("per_user_limit"),
-                    rs.getInt("matched"), rs.getInt("available"), prior);
-        });
-        if (show.isEmpty()) throw ApiError.notFound("show not found");
-        Preflight state = show.get(0);
+        Preflight state = preflights.read(showId, userId, key, seats);
+        if (state == null) throw ApiError.notFound("show not found");
         int limit = state.limit();
         if (seats.size() > limit) throw decline("per_user_limit", "would exceed per-user limit of " + limit);
         long amount;

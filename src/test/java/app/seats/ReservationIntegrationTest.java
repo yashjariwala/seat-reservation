@@ -51,6 +51,27 @@ class ReservationIntegrationTest {
         } finally { start.countDown(); workers.shutdownNow(); }
     }
 
+    @Test void batchedReadsIsolateBuyersShowsAndInvalidRequests() throws Exception {
+        var labels = IntStream.range(0, 10).mapToObj(i -> "S\"" + i).toList();
+        List<UUID> ids = List.of(show(labels), show(labels), show(labels));
+        List<Callable<ResponseEntity<JsonNode>>> work = new ArrayList<>();
+        for (UUID id : ids) for (String label : labels) {
+            String token = auth.issue("batch-" + UUID.randomUUID());
+            work.add(() -> reserve(id, token, "key", List.of(label)));
+        }
+        for (int i = 0; i < 10; i++) {
+            String token = auth.issue("invalid-" + UUID.randomUUID());
+            work.add(() -> reserve(ids.get(0), token, "key", List.of("missing")));
+            work.add(() -> reserve(UUID.randomUUID(), token, "key", List.of("missing")));
+        }
+        var results = concurrent(work);
+        assertThat(results.stream().filter(r -> r.getStatusCode().value() == 201).count()).isEqualTo(30);
+        assertThat(results.stream().filter(r -> r.getStatusCode().value() == 400).count()).isEqualTo(10);
+        assertThat(results.stream().filter(r -> r.getStatusCode().value() == 404).count()).isEqualTo(10);
+        for (UUID id : ids)
+            assertThat(db.queryForObject("SELECT count(*) FROM seats WHERE show_id=? AND status='confirmed'", Integer.class, id)).isEqualTo(10);
+    }
+
     @Test void guardedUpsertLimitsNewUsersAndRollsBackDeclinedReservationRows() throws Exception {
         var labels = IntStream.range(0, 20).mapToObj(i -> "S" + i).toList();
         UUID id = show(labels);
