@@ -36,6 +36,21 @@ Local result (M-series Mac, Postgres 16, pool of 10):
 | 20,000 | 1,000 | 4.8 s | 0 | all pass |
 | 100,000 | 5,000 | ~10 s | 0 | all pass |
 
+## Live dashboard
+
+Open `/` to view live health, throughput, latency, reservation outcomes and seat reconciliation. The **Start burst** button creates a fresh show and runs one of two fixed presets:
+
+| Preset | Requests | Concurrent clients | Seats |
+|---|---|---|---|
+| Quick demo | 2,000 | 16 | 500 |
+| Assignment burst | 20,000 | 32 | 5,000 |
+
+The request mix is 40% hot-seat contention, 10% retries, 1% key reuse, 200 per-user-limit attempts, and random single/multi-seat requests. Final checks cover all-or-nothing booking, owner-only double cancellation, guaranteed rebooking, spoofed identity, and a late cancellation after rebooking. Outcomes count the initial reservation burst; the subsequent checks also appear in service metrics.
+
+Runs are shared across visitors on the instance. `POST /api/burst` accepts only `{"preset":"demo"}` or `{"preset":"full"}`; `GET /api/burst` returns live progress and the latest results. Only one run can execute at a time, followed by a 5-minute cooldown (`BURST_COOLDOWN_SECONDS`, default 300). Runs are limited to ten minutes, and results are held in memory until the next run or restart. The public runner creates demo inventory; it never returns credentials or accepts a target URL.
+
+Dashboard requests use the local HTTP reservation API on the deployed server, so they exercise actual transactions and metrics without sending the admin key to the browser. They do **not** measure the Render edge/network. Use `./burst.sh <PUBLIC_URL>` for that external load test.
+
 ## API
 
 All money is integer paise. JSON field names are snake_case.
