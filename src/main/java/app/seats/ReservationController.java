@@ -12,6 +12,7 @@ import java.util.*;
  * Reserve = one transaction through three atomic gates, always locked in this order
  * (reservation key -> user counter -> seats sorted by label), so no two transactions
  * can wait on each other in a cycle:
+ *   0. fast decline: unlocked read; if a seat is already gone, 409 without locking
  *   1. idempotency: INSERT ... ON CONFLICT (user_id, idem_key) DO NOTHING
  *   2. per-user limit: UPDATE user_counts ... WHERE seat_count + n <= limit
  *   3. seats: lock rows ORDER BY label, then UPDATE ... WHERE status = 'available'
@@ -56,6 +57,26 @@ public class ReservationController {
         long amount = ((Number) show.get(0).get("price_paise")).longValue() * seats.size();
         int limit = ((Number) show.get(0).get("per_user_limit")).intValue();
 
+        // Fast path: decline without taking any lock if a seat is already gone. Safe because a stale
+        // read can only cause a decline, never a sale — the locked gates below stay the sole authority.
+        // Seats are read BEFORE the key: if a same-key twin just took these seats, its committed row is
+        // then guaranteed visible below, so a retry still gets its original reservation, not a 409.
+        Object[] labels = seats.toArray();
+        int[] avail = db.query(con -> {
+            var ps = con.prepareStatement("""
+                    SELECT count(*), count(*) FILTER (WHERE status = 'available')
+                    FROM seats WHERE show_id = ? AND label = ANY(?)""");
+            ps.setObject(1, showId);
+            ps.setArray(2, con.createArrayOf("text", labels));
+            return ps;
+        }, (rs, i) -> new int[]{rs.getInt(1), rs.getInt(2)}).get(0);
+        if (avail[0] != seats.size()) throw ApiError.badRequest("unknown seats for this show");
+        if (avail[1] < seats.size()) {
+            var prior = db.queryForList("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key);
+            if (!prior.isEmpty()) return replay(prior.get(0), requestHash);
+            throw decline("seat_taken", "one or more seats are no longer available");
+        }
+
         // Gate 1: idempotency. A concurrent request with the same key blocks on the unique
         // index until this transaction commits (then sees our row) or rolls back (then wins).
         UUID id = UUID.randomUUID();
@@ -73,13 +94,8 @@ public class ReservationController {
             ps.setLong(7, amount);
             return ps;
         });
-        if (inserted == 0) {
-            var prior = db.queryForMap("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key);
-            if (!requestHash.equals(prior.get("request_hash")))
-                throw decline("idempotency_key_reused", "idempotency key was used with a different request");
-            obs.declined("idempotent_replay");
-            return ResponseEntity.ok(toReservation(prior));  // replay: original result, nothing moves
-        }
+        if (inserted == 0)
+            return replay(db.queryForMap("SELECT * FROM reservations WHERE user_id = ? AND idem_key = ?", userId, key), requestHash);
 
         // Gate 2: per-user limit, checked and incremented in one statement.
         db.update("INSERT INTO user_counts (show_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING", showId, userId);
@@ -90,7 +106,6 @@ public class ReservationController {
         if (counted == 0) throw decline("per_user_limit", "would exceed per-user limit of " + limit);
 
         // Gate 3: lock the requested seats in label order (deadlock-free), then flip only available ones.
-        Object[] labels = seats.toArray();
         List<String> found = db.query(con -> {
             var ps = con.prepareStatement("SELECT label FROM seats WHERE show_id = ? AND label = ANY(?) ORDER BY label FOR UPDATE");
             ps.setObject(1, showId);
@@ -136,6 +151,14 @@ public class ReservationController {
         db.update("UPDATE seats SET status = 'available', reservation_id = NULL WHERE reservation_id = ?", id);
         db.update("UPDATE reservations SET status = 'cancelled' WHERE id = ?", id);
         return new Reservation(r.reservationId(), r.showId(), userId, r.seats(), r.amountPaise(), "cancelled");
+    }
+
+    /** Same key seen before: same body -> the original reservation (200); different body -> 409. */
+    private ResponseEntity<Reservation> replay(Map<String, Object> prior, String requestHash) {
+        if (!requestHash.equals(prior.get("request_hash")))
+            throw decline("idempotency_key_reused", "idempotency key was used with a different request");
+        obs.declined("idempotent_replay");
+        return ResponseEntity.ok(toReservation(prior));  // nothing moves
     }
 
     private static Reservation toReservation(Map<String, Object> r) {

@@ -9,5 +9,6 @@ FROM eclipse-temurin:17-jre
 WORKDIR /app
 COPY --from=build /src/target/app.jar app.jar
 EXPOSE 8080
-# Container-aware heap; free tiers give ~512MB.
-ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "app.jar"]
+# Container-aware heap; free tiers give ~512MB and 0.1 CPU: serial GC and C1-only JIT keep
+# GC threads and C2 compilation from eating the CPU the requests need.
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-XX:+UseSerialGC", "-XX:TieredStopAtLevel=1", "-jar", "app.jar"]
