@@ -186,3 +186,27 @@ With this change, the profiled 16-worker run received 5,665 responses before 14,
 3. No Render health check, deliberately: Render evicts an instance whose check takes >5s for 15s and restarts it after 60s; on 0.1 CPU a burst queues health checks past that, so the check would take down a busy-but-correct instance. In Render → Settings, leave **Health Check Path empty**. A crashed process is still restarted.
 
 Config: `PORT`, `DATABASE_URL`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DB_POOL_SIZE` (10), `TOKEN_SECRET`, `ADMIN_KEY`.
+
+## Northflank Sandbox deployment
+
+Create a combined service from this repository's `main` branch using `/Dockerfile`, and expose HTTP port 8080 publicly. Select the free Sandbox allocation; our deployed service has 0.2 shared CPU and 512 MiB RAM. Set runtime variables `PORT=8080`, `DATABASE_URL` (the Neon JDBC URL with `sslmode=require`), `DATABASE_USER`, `DATABASE_PASSWORD`, `ADMIN_KEY`, and `TOKEN_SECRET`. Without `DATABASE_URL`, the application defaults to localhost PostgreSQL and cannot start in this container. Keep credentials in Northflank runtime secrets, never in Git.
+
+Use an HTTP startup probe on `/actuator/health/readiness`, port 8080, with initial delay 10s, period 10s, timeout 10s and failure threshold 30. Use a readiness probe on the same endpoint with initial delay 10s, period 30s, timeout 60s and failure threshold 6. These tolerances let a small CPU allocation drain a queue before losing routing. No HTTP liveness probe is configured: a saturated servlet worker pool must not trigger a restart of a live process. A process crash is still restarted by the platform. Readiness checks the database; the public homepage, readiness endpoint and `/actuator/prometheus` should all return 200 after startup.
+
+Confirm the deployed commit SHA matches GitHub before testing. A healthy deployment is separate from passing the full 20,000-request burst; the Sandbox CPU quota and public ingress still need load validation.
+
+
+## Oracle Always Free deployment
+
+`deploy/oracle/compose.yaml` runs the same Dockerfile with a 512 MiB app memory limit and a two-CPU ceiling behind Caddy HTTPS. Neon remains the database. Use an Always Free eligible A1 instance in the tenancy's home region, within the account's current aggregate CPU, RAM and storage allowance; do not assume older published allowances still apply. Open TCP 80/443 in OCI networking; keep the app and database ports private.
+
+The Ubuntu 24.04 ARM bootstrap is `deploy/oracle/bootstrap.sh`. Place the repository in `/opt/seat-reservation` and create a mode-600 `.env` containing `DATABASE_URL`, `DATABASE_USER`, `DATABASE_PASSWORD`, `TOKEN_SECRET`, `ADMIN_KEY`, and `SITE_DOMAIN` (a domain pointing at the VM, such as `<public-ip>.sslip.io`). Then run:
+
+```bash
+cd /opt/seat-reservation
+docker compose --env-file .env -f deploy/oracle/compose.yaml up --build -d
+curl --fail https://YOUR_DOMAIN/actuator/health/readiness
+docker compose --env-file .env -f deploy/oracle/compose.yaml logs -f app
+```
+
+Caddy forwards upstream traffic over HTTP/2 cleartext to multiplex reservations without an internal TCP connection per request. Its certificate data persists in Docker volumes. Both services restart automatically and retain rotated logs. The public `/actuator/prometheus` endpoint and the existing burst command remain available. A successful local two-CPU container test does not establish a live Oracle pass; public ingress, TLS and Neon latency must still be checked.

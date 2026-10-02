@@ -1,6 +1,8 @@
 package app.seats;
 
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.MediaType;
+import java.nio.charset.StandardCharsets;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -22,6 +24,10 @@ import java.util.*;
  */
 @RestController
 public class ReservationController {
+    private static final ResponseEntity<byte[]> SEAT_TAKEN = ResponseEntity.status(409)
+            .contentType(MediaType.APPLICATION_JSON)
+            .body("{\"error\":\"seat_taken\",\"message\":\"one or more seats are no longer available\"}"
+                    .getBytes(StandardCharsets.UTF_8));
     private final JdbcTemplate db;
     private final Auth auth;
     private final Obs obs;
@@ -48,7 +54,7 @@ public class ReservationController {
     record Preflight(long price, int limit, int matched, int available, Reservation prior) {}
 
     @PostMapping("/shows/{showId}/reserve")
-    ResponseEntity<Reservation> reserve(@PathVariable UUID showId,
+    ResponseEntity<?> reserve(@PathVariable UUID showId,
                                         @RequestHeader(value = "Authorization", required = false) String authz,
                                         @RequestHeader(value = "Idempotency-Key", required = false) String keyHeader,
                                         @RequestBody ReserveRequest req) {
@@ -74,8 +80,12 @@ public class ReservationController {
         try { amount = Math.multiplyExact(state.price(), seats.size()); }
         catch (ArithmeticException e) { throw ApiError.badRequest("amount overflows"); }
         if (state.matched() != seats.size()) throw ApiError.badRequest("unknown seats for this show");
-        if (state.available() < seats.size())
-            throw decline("seat_taken", "one or more seats are no longer available");
+        if (state.available() < seats.size()) {
+            // This autocommit read needs no rollback. Skip exception resolution and
+            // repeat JSON serialization for the dominant hot-seat decline.
+            obs.declined("seat_taken");
+            return SEAT_TAKEN;
+        }
 
         return transactions.execute(status -> book(showId, userId, key, seats, amount, limit));
     }
