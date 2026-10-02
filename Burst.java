@@ -1,4 +1,6 @@
 import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.net.http.*;
 import java.time.Duration;
 import java.util.*;
@@ -10,7 +12,7 @@ import java.util.stream.*;
 /**
  * On-sale stampede against a running service. JDK 17+, no deps:
  *   java Burst.java <BASE_URL> [requests=20000] [concurrency=1000] [seats=5000]
- * Env ADMIN_KEY (default dev-admin-key). Exit code 0 only if every correctness check passes.
+ * ADMIN_KEY from environment or .env (default dev-admin-key for localhost only). Exit code 0 only if every correctness check passes.
  */
 public class Burst {
     static final int HOT_SEATS = 5, LIMIT = 4, LIMIT_USERS = 20, LIMIT_FIRES = 10;
@@ -24,6 +26,23 @@ public class Burst {
     record Req(String user, String key, List<String> seats, String kind) {}
     record Res(Req req, int status, String code, String reservationId) {}
 
+    static String adminKey() throws Exception {
+        String key = System.getenv("ADMIN_KEY");
+        if (key == null && Files.exists(Path.of(".env"))) {
+            for (String line : Files.readAllLines(Path.of(".env"))) {
+                if (line.startsWith("ADMIN_KEY=")) {
+                    key = line.substring(10).trim();
+                    if (key.length() >= 2 && ((key.startsWith("\"") && key.endsWith("\""))
+                            || (key.startsWith("'") && key.endsWith("'")))) key = key.substring(1, key.length()-1);
+                }
+            }
+        }
+        if ((key == null || key.isBlank()) && Set.of("localhost", "127.0.0.1", "::1", "[::1]").contains(URI.create(base).getHost()))
+            key = "dev-admin-key";
+        if (key == null || key.isBlank()) throw new IllegalStateException("Set ADMIN_KEY in the environment or git-ignored .env");
+        return key;
+    }
+
     public static void main(String[] a) {
         try { run(a); } catch (Throwable e) { e.printStackTrace(); System.exit(2); }
     }
@@ -33,7 +52,7 @@ public class Burst {
         int total = a.length > 1 ? Integer.parseInt(a[1]) : 20000;
         int conc = a.length > 2 ? Integer.parseInt(a[2]) : 1000;
         int nSeats = a.length > 3 ? Integer.parseInt(a[3]) : 5000;
-        String adminKey = Optional.ofNullable(System.getenv("ADMIN_KEY")).orElse("dev-admin-key");
+        String adminKey = adminKey();
         // HTTPS: HTTP/2 multiplexes the burst over a few TLS connections instead of a handshake per in-flight
         // request (the edge resets handshake storms from one IP). Plain http (local) stays HTTP/1.1.
         var exec = Executors.newFixedThreadPool(32);
@@ -100,42 +119,81 @@ public class Burst {
             }
         }).toList(), 200);
 
+        if (conc >= reqs.size()) {
+            var warm = new ArrayList<CompletableFuture<HttpResponse<String>>>();
+            for (HttpClient client : clients) warm.add(client.sendAsync(
+                    HttpRequest.newBuilder(URI.create(base + "/actuator/health/liveness"))
+                            .timeout(Duration.ofSeconds(60)).build(), HttpResponse.BodyHandlers.ofString()));
+            CompletableFuture.allOf(warm.toArray(CompletableFuture[]::new)).join();
+            if (warm.stream().anyMatch(f -> f.join().statusCode() != 200))
+                throw new IllegalStateException("Connection warm-up failed before measured burst");
+        }
+
         // ---- burst, with an invariant watcher polling show state ----
         Map<String, Double> before = scrape();
         List<String> invariantViolations = new CopyOnWriteArrayList<>();
         AtomicBoolean running = new AtomicBoolean(true);
-        AtomicInteger polls = new AtomicInteger();
+        AtomicInteger polls = new AtomicInteger(), failedPolls = new AtomicInteger();
         Thread watcher = new Thread(() -> {
             while (running.get()) {
                 try {
                     int[] c = counts(get("/shows/" + show).body());
                     polls.incrementAndGet();
                     if (c[0] + c[1] + c[2] != c[3]) invariantViolations.add(Arrays.toString(c));
-                    Thread.sleep(500);
-                } catch (Exception ignored) {}
+                } catch (Exception ignored) { failedPolls.incrementAndGet(); }
+                try { Thread.sleep(500); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
             }
         });
         watcher.start();
 
         System.out.printf("firing %d reserve requests...%n", reqs.size());
         long t0 = System.nanoTime();
+        double submissionSpan = Double.NaN;
         List<Res> results = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger netErrors = new AtomicInteger();
-        runAll(reqs.stream().map(r -> (Callable<Object>) () -> {
-            String body = "{\"idempotency_key\":\"" + show.substring(0, 8) + "-" + r.key() + "\",\"seats\":["
-                    + r.seats().stream().map(s -> "\"" + s + "\"").collect(Collectors.joining(",")) + "]}";
-            try {
-                HttpResponse<String> resp = send("POST", "/shows/" + show + "/reserve", body,
-                        Map.of("Authorization", "Bearer " + tokens.get(r.user())));
-                String rid = resp.statusCode() < 300 ? field(resp.body(), "reservation_id") : null;
-                String code = resp.statusCode() < 300 ? "ok"
-                        : resp.body().contains("\"error\"") ? field(resp.body(), "error") : "edge (not from app): " + resp.body().strip();
-                results.add(new Res(r, resp.statusCode(), code, rid));
-            } catch (Exception e) {
-                netErrors.incrementAndGet();
+        if (conc >= reqs.size()) {
+            // 20,000 outstanding requests use asynchronous I/O, not 20,000 platform threads.
+            var requests = new ArrayList<HttpRequest>();
+            for (Req r : reqs) {
+                String body = "{\"idempotency_key\":\"" + show.substring(0, 8) + "-" + r.key() + "\",\"seats\":["
+                        + r.seats().stream().map(label -> "\"" + label + "\"").collect(Collectors.joining(",")) + "]}";
+                requests.add(HttpRequest.newBuilder(URI.create(base + "/shows/" + show + "/reserve"))
+                        .timeout(Duration.ofSeconds(180)).header("Content-Type", "application/json")
+                        .header("Authorization", "Bearer " + tokens.get(r.user()))
+                        .POST(HttpRequest.BodyPublishers.ofString(body)).build());
             }
-            return null;
-        }).toList(), conc);
+            t0 = System.nanoTime();
+            var done = new ArrayList<CompletableFuture<Void>>();
+            for (int i = 0; i < requests.size(); i++) {
+                Req work = reqs.get(i);
+                done.add(clients[i / 80].sendAsync(requests.get(i), HttpResponse.BodyHandlers.ofString())
+                        .handle((response, error) -> {
+                            if (error != null) netErrors.incrementAndGet();
+                            else {
+                                try { results.add(result(work, response)); }
+                                catch (Exception e) { netErrors.incrementAndGet(); }
+                            }
+                            return null;
+                        }));
+            }
+            submissionSpan = (System.nanoTime() - t0) / 1e9;
+            System.out.printf("submission_span_seconds=%.3f (client dispatch; arrival timing not verified)%n", submissionSpan);
+            CompletableFuture.allOf(done.toArray(CompletableFuture[]::new)).join();
+        } else {
+            runAll(reqs.stream().map(r -> (Callable<Object>) () -> {
+                String body = "{\"idempotency_key\":\"" + show.substring(0, 8) + "-" + r.key() + "\",\"seats\":["
+                        + r.seats().stream().map(s -> "\"" + s + "\"").collect(Collectors.joining(",")) + "]}";
+                try {
+                    HttpResponse<String> resp = send("POST", "/shows/" + show + "/reserve", body,
+                            Map.of("Authorization", "Bearer " + tokens.get(r.user())));
+                    results.add(result(r, resp));
+                } catch (Exception e) {
+                    netErrors.incrementAndGet();
+                }
+                return null;
+            }).toList(), conc);
+        }
         double secs = (System.nanoTime() - t0) / 1e9;
         running.set(false);
         watcher.join();
@@ -147,9 +205,14 @@ public class Burst {
         System.out.printf("  %-32s %d%n", "network errors/timeouts", netErrors.get());
 
         List<String> fails = new ArrayList<>();
+        if (!Double.isNaN(submissionSpan))
+            check(fails, submissionSpan <= 1, "all requests dispatched within one second (" + submissionSpan + " s)");
         long fiveXX = results.stream().filter(r -> r.status() >= 500).count();
         check(fails, fiveXX == 0, "zero 5xx (got " + fiveXX + ")");
         check(fails, netErrors.get() == 0, "zero network errors (got " + netErrors.get() + ")");
+        long unexpected = results.stream().filter(r -> r.status() != 200 && r.status() != 201
+                && !(r.status() == 409 && Set.of("seat_taken", "per_user_limit", "idempotency_key_reused").contains(r.code()))).count();
+        check(fails, unexpected == 0, "only successful/replayed reservations or domain declines (unexpected=" + unexpected + ")");
 
         List<Res> created = results.stream().filter(r -> r.status() == 201).toList();
         for (String s : hot) {
@@ -189,7 +252,7 @@ public class Burst {
         System.out.printf("%nFinal show state: available=%d held=%d confirmed=%d total=%d%n", c[0], c[1], c[2], c[3]);
         check(fails, c[0] + c[1] + c[2] == c[3], "reconciliation: available+held+confirmed == total");
         check(fails, c[2] == soldSeats, "confirmed seats (" + c[2] + ") == seats in 201 responses (" + soldSeats + ")");
-        check(fails, invariantViolations.isEmpty(), "invariant held during burst (" + polls.get() + " polls, violations=" + invariantViolations.size() + ")");
+        check(fails, polls.get() > 0 && failedPolls.get() == 0 && invariantViolations.isEmpty(), "invariant observed during burst (" + polls.get() + " polls, failed reads=" + failedPolls.get() + ", violations=" + invariantViolations.size() + ")");
 
         Thread.sleep(2500);   // seat gauges refresh every 1s
         Map<String, Double> after = scrape();
@@ -310,6 +373,13 @@ public class Burst {
         if (!ok) fails.add(what);
     }
 
+    static Res result(Req work, HttpResponse<String> response) {
+        String id = response.statusCode() < 300 ? field(response.body(), "reservation_id") : null;
+        String code = response.statusCode() < 300 ? "ok"
+                : response.body().contains("\"error\"") ? field(response.body(), "error") : "non-domain response";
+        return new Res(work, response.statusCode(), code, id);
+    }
+
     static void runAll(List<Callable<Object>> tasks, int conc) throws Exception {
         Semaphore sem = new Semaphore(conc);
         ExecutorService ex = Executors.newFixedThreadPool(conc);
@@ -355,7 +425,8 @@ public class Burst {
         String[] keys = {"available", "held", "confirmed", "total_seats"};
         for (int i = 0; i < 4; i++) {
             Matcher m = Pattern.compile("\"" + keys[i] + "\"\\s*:\\s*(\\d+)").matcher(json);
-            if (m.find()) c[i] = Integer.parseInt(m.group(1));
+            if (!m.find()) throw new IllegalStateException("Incomplete inventory response");
+            c[i] = Integer.parseInt(m.group(1));
         }
         return c;
     }
