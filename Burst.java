@@ -194,6 +194,72 @@ public class Burst {
             check(fails, (int) g == c[i], "gauge seats{" + st[i] + "} (" + (int) g + ") == API (" + c[i] + ")");
         }
 
+        // ---- phase 2: cancel races, rebooking, spoofed identity ----
+        // For each victim reservation, concurrently: owner cancels twice, an attacker tries to cancel, and three
+        // other users try to rebook the same seats while spoofing "user_id": <owner> in the body.
+        List<Res> victims = created.stream().filter(r -> r.req().kind().equals("cold")).limit(200).toList();
+        Map<String, String> p2tokens = new ConcurrentHashMap<>();
+        List<String> p2users = new ArrayList<>(List.of("attacker"));
+        for (int i = 0; i < victims.size(); i++) for (int j = 0; j < 3; j++) p2users.add("rb-" + i + "-" + j);
+        runAll(p2users.stream().map(u -> (Callable<Object>) () -> {
+            p2tokens.put(u, field(send("POST", "/auth/token", "{\"user_id\":\"" + u + "\"}", Map.of("X-Admin-Key", adminKey)).body(), "token"));
+            return null;
+        }).toList(), 100);
+        record P2(String kind, int victim, String user, int status, String body) {}
+        List<P2> p2 = Collections.synchronizedList(new ArrayList<>());
+        List<Callable<Object>> p2tasks = new ArrayList<>();
+        for (int i = 0; i < victims.size(); i++) {
+            int vi = i;
+            Res v = victims.get(i);
+            String cancelPath = "/reservations/" + v.reservationId() + "/cancel";
+            for (int k = 0; k < 2; k++) p2tasks.add(() -> {
+                var resp = send("POST", cancelPath, "{}", Map.of("Authorization", "Bearer " + tokens.get(v.req().user())));
+                p2.add(new P2("owner_cancel", vi, v.req().user(), resp.statusCode(), resp.body()));
+                return null;
+            });
+            p2tasks.add(() -> {
+                var resp = send("POST", cancelPath, "{}", Map.of("Authorization", "Bearer " + p2tokens.get("attacker")));
+                p2.add(new P2("attacker_cancel", vi, "attacker", resp.statusCode(), resp.body()));
+                return null;
+            });
+            for (int j = 0; j < 3; j++) {
+                String u = "rb-" + i + "-" + j;
+                String body = "{\"user_id\":\"" + v.req().user() + "\",\"idempotency_key\":\"" + show.substring(0, 8) + "-rb-" + i + "-" + j
+                        + "\",\"seats\":[" + v.req().seats().stream().map(s -> "\"" + s + "\"").collect(Collectors.joining(",")) + "]}";
+                p2tasks.add(() -> {
+                    var resp = send("POST", "/shows/" + show + "/reserve", body, Map.of("Authorization", "Bearer " + p2tokens.get(u)));
+                    p2.add(new P2("rebook", vi, u, resp.statusCode(), resp.body()));
+                    return null;
+                });
+            }
+        }
+        Collections.shuffle(p2tasks, rnd);
+        System.out.printf("%nPhase 2: %d victims -> %d concurrent cancel/attack/rebook requests%n", victims.size(), p2tasks.size());
+        runAll(p2tasks, conc);
+        p2.stream().collect(Collectors.groupingBy(x -> x.kind() + " " + x.status(), TreeMap::new, Collectors.counting()))
+                .forEach((k, n) -> System.out.printf("  %-32s %d%n", k, n));
+
+        long p2fiveXX = p2.stream().filter(x -> x.status() >= 500).count();
+        check(fails, p2fiveXX == 0, "phase 2: zero 5xx (got " + p2fiveXX + ")");
+        long attackerOk = p2.stream().filter(x -> x.kind().equals("attacker_cancel") && x.status() != 404).count();
+        check(fails, attackerOk == 0, "cancel someone else's reservation -> 404 (non-404s=" + attackerOk + ")");
+        long ownerBad = p2.stream().filter(x -> x.kind().equals("owner_cancel") && (x.status() != 200 || !x.body().contains("\"cancelled\""))).count();
+        check(fails, ownerBad == 0, "owner double-cancel: both 200 cancelled (bad=" + ownerBad + ")");
+        long spoofed = p2.stream().filter(x -> x.kind().equals("rebook") && x.status() == 201 && !field(x.body(), "user_id").equals(x.user())).count();
+        check(fails, spoofed == 0, "spoofed body user_id ignored: every 201 is the token's user (violations=" + spoofed + ")");
+        Map<Integer, Long> rebookWins = p2.stream().filter(x -> x.kind().equals("rebook") && x.status() == 201)
+                .collect(Collectors.groupingBy(P2::victim, Collectors.counting()));
+        long multiWin = rebookWins.values().stream().filter(n -> n > 1).count();
+        check(fails, multiWin == 0, "freed seats rebooked by at most one user each (victims with >1 winner=" + multiWin + ")");
+        int cancelledSeats = victims.stream().mapToInt(v -> v.req().seats().size()).sum();
+        int rebookedSeats = rebookWins.keySet().stream().mapToInt(vi -> victims.get(vi).req().seats().size()).sum();
+        int[] c2 = counts(get("/shows/" + show).body());
+        int expected = c[2] - cancelledSeats + rebookedSeats;
+        System.out.printf("  rebooked %d of %d victims; final available=%d held=%d confirmed=%d total=%d%n",
+                rebookWins.size(), victims.size(), c2[0], c2[1], c2[2], c2[3]);
+        check(fails, c2[2] == expected, "confirmed after phase 2 (" + c2[2] + ") == before - cancelled + rebooked (" + expected + ")");
+        check(fails, c2[0] + c2[1] + c2[2] == c2[3], "reconciliation after phase 2: available+held+confirmed == total");
+
         System.out.println(fails.isEmpty() ? "\nALL CHECKS PASSED" : "\nFAILED: " + fails.size() + " check(s)");
         System.exit(fails.isEmpty() ? 0 : 1);
     }
