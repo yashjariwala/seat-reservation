@@ -119,6 +119,16 @@ curl -s -XPOST $B/shows/$SHOW/reserve -H "Authorization: Bearer $TOKEN" -H 'cont
   - `http_server_requests_seconds_count{status}` — 5xx rate
 - Logs: one JSON line per request with `request_id` (inbound `X-Request-Id` honoured, echoed back), `user_id`, `outcome`, `status`, `duration_ms`.
 
+To capture resource evidence during a manual live test, start this read-only recorder in another terminal before the burst:
+
+```bash
+python3 scripts/record_metrics.py https://seat-reservation-62kf.onrender.com --seconds 300 --output /tmp/seatlab-live-metrics.jsonl
+```
+
+It samples every two seconds, saves JVM memory/GC, CPU time, process uptime, connection-pool and reservation metrics, and records failed scrapes and observed uptime resets. It sends no reservations. Failed scrapes leave observation gaps; JVM metrics do not measure complete container RSS, and CPU usage gauges are not a direct percentage of Render's quota. Cumulative CPU-time deltas between successful scrapes can estimate average core usage for that interval. No credentials are needed.
+
+The server also writes `resource_sample` structured log entries every five seconds from its own dedicated thread. These include instance ID, uptime, heap/nonheap/direct memory, CPU cores used over the actual sampling interval, cumulative GC time and DB active/idle/waiting counts. When accessible on Linux, the cgroup memory counter is included as `container_memory_bytes`; this is container memory accounting, not JVM heap or process RSS. No database query or public HTTP request is needed. Search Render logs for `resource_sample` during a burst. Samples can still be delayed by CPU starvation, GC pauses or logging backpressure, so inspect `sample_interval_seconds` and timestamp gaps. Set `resource.sampling.enabled=false` to disable it.
+
 ## Regression tests
 
 `./mvnw test` runs unit tests. For the complete PostgreSQL suite, create a dedicated local database and enable fault injection explicitly:
