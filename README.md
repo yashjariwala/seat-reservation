@@ -159,6 +159,24 @@ python3 scripts/verify_restart.py
 This script creates and removes its own disposable local database, launches separate JVMs on an unused local port, kills its own child process before and after commit, and checks same-key recovery after each restart. It saves a JSON report and app logs in a temporary directory printed on completion. It does not connect to the public service.
 
 
+To reproduce a Docker CPU-limited burst locally:
+
+```bash
+python3 scripts/benchmark_docker.py --workers 64 --cpus 0.1 --compiler c1
+python3 scripts/benchmark_docker.py --workers 64 --cpus 0.1 --compiler tiered
+```
+
+Docker must be running. Each invocation builds and copies an immutable JAR, creates its own disposable PostgreSQL container/database, and runs 20,000 requests with 20,000 client concurrency against a local app limited to 0.1 CPU and 512 MB. Startup, burst logs and results are saved in the printed temporary directory; only its own containers/network are removed. `--workers 64 16` compares worker counts sequentially; `--profile` enables JFR for every variant and adds overhead. Database CPU is not capped, and local networking does not reproduce Neon latency or Render's public ingress. This test is separate from an unrestricted local pass and from live acceptance.
+
+
+On 2026-10-02, CPU-limited runs of the current app with 64 workers and JFR profiling both failed: C1 returned 4,508 responses before 15,492 request timeouts; normal tiered compilation returned 2,103 responses before 17,897 timeouts. Each reservation phase reached the 180-second client deadline, and final inventory reads timed out, so full reconciliation and phase 2 were not verified. Tiered compilation also took 287.6 seconds to reach readiness. Neither run exhausted the heap; sampled worker queues peaked at 18,754 and 18,885 respectively. These are profiled local-container results, not live acceptance results or precise forecasts of Render performance. The production compiler setting was retained.
+
+
+An additional 16-worker CPU-limited comparison found every servlet worker waiting for HTTP request-body data while the preflight readers and database were idle. The app now buffers small bodies asynchronously before servlet dispatch using Undertow's `RequestBufferingHandler`, capped at four pooled buffers per request (4 KiB with the configured buffer size); larger bodies retain streaming behavior. Booking decisions and HTTP status semantics are unchanged. A regression test holds eight partial bodies open with four workers, checks liveness, then completes every body and verifies successful token responses.
+
+With this change, the profiled 16-worker run received 5,665 responses before 14,335 timeouts, compared with 165 responses and 19,835 timeouts without buffering. Both failed acceptance; final inventory reads timed out and phase 2 was not verified. The unrestricted local 20,000-request burst passed in 4.5 seconds and all 22 PostgreSQL/unit regression tests passed. These results do not establish a CPU-limited or live pass, and the 64-worker production default is retained pending comparison.
+
+
 ## Deploy (Render + Neon, both free)
 
 1. Neon: create a project → copy host, database, user, password.
