@@ -122,3 +122,17 @@ Validation: all 19 final tests passed with local PostgreSQL and fault injection 
 | 3 | 21.0 | 11.7 | 13.234 | 9.800 |
 
 All six runs passed the full generator checks, including cancellation/identity/rebooking. Each used a fresh 5,000-seat show and the same injected 8 ms delay per PostgreSQL ReadyForQuery message. Median reservation time improved 46.7%; median full-test process CPU improved 25.9%. The measurement used unrestricted local CPU, not Render's 0.1 CPU quota.
+
+## Public verification of server-side booking gates — 2026-10-02
+
+Render successfully deployed commit `c3020c5b41ca9edd0373cb812b67a7797e17aa91`; the public health endpoint reported UP, including PostgreSQL and readiness. This is deployment readiness evidence, not a separate idle cold-start experiment.
+
+The distinct-buyer single-seat test dispatched 500 requests in 0.008 seconds and completed in 7.542 seconds: exactly one 201 and 499 seat-taken 409s, with exactly one confirmed seat afterward. It passed.
+
+The full mixed test used `./burst.sh https://seat-reservation-62kf.onrender.com 20000 20000 5000` on fresh show `1d6beefa-652f-46a1-8c39-35a516db8ddc`. Client dispatch took 0.103 seconds; the reservation phase completed in 87.5 seconds. Outcomes: 2,493 confirmations, 126 replays, 5,324 seat-taken declines, 57 limit declines, 19 key-reuse declines, 10,669 HTTP 429s, 1,312 HTTP 502s, and zero transport failures. All outcomes sum to 20,000.
+
+Three checks failed: zero 5xx, only successful/replayed reservations or domain declines, and inventory observation coverage (two successful polls, 104 failed reads, zero observed invariant violations). Each hot seat had one received 201, but the rejected responses mean that not every losing contender received the required 409. Observed uniqueness, per-user limits, idempotency and final reconciliation passed. All reservation metric deltas matched received domain responses. Final counts exactly matched client-confirmed seats: 2,081 available, zero held, 2,919 confirmed out of 5,000.
+
+The subsequent 1,200-request cancellation/attack/rebooking phase passed every check with zero 5xx: all 200 attacker cancellations returned 404; 400 owner cancellations returned 200; 179 seats were rebooked during the race and the remaining 21 afterward. Token-derived identity, unique rebooking and final reconciliation held.
+
+The full simultaneous public acceptance bar remains unmet. Faster completion than earlier individual live runs does not establish a controlled production speed improvement, especially because the proportion of rejected requests changed. The controlled local paired benchmark above establishes the optimization's measured benefit under its stated conditions. Raw logs for this run are `/tmp/seatlab-function-live-500.log` and `/tmp/seatlab-function-live-simultaneous.log` on the development machine.
