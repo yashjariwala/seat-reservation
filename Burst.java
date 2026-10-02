@@ -20,7 +20,11 @@ public class Burst {
     record Req(String user, String key, List<String> seats, String kind) {}
     record Res(Req req, int status, String code, String reservationId) {}
 
-    public static void main(String[] a) throws Exception {
+    public static void main(String[] a) {
+        try { run(a); } catch (Exception e) { e.printStackTrace(); System.exit(2); }
+    }
+
+    static void run(String[] a) throws Exception {
         base = a.length > 0 ? a[0].replaceAll("/+$", "") : "http://localhost:8080";
         int total = a.length > 1 ? Integer.parseInt(a[1]) : 20000;
         int conc = a.length > 2 ? Integer.parseInt(a[2]) : 1000;
@@ -75,8 +79,12 @@ public class Burst {
         Set<String> users = reqs.stream().map(Req::user).collect(Collectors.toSet());
         System.out.printf("minting %d tokens...%n", users.size());
         runAll(users.stream().map(u -> (Callable<Object>) () -> {
-            tokens.put(u, field(send("POST", "/auth/token", "{\"user_id\":\"" + u + "\"}", Map.of()).body(), "token"));
-            return null;
+            for (int attempt = 1; ; attempt++) {   // setup, not the test: retry transient edge errors
+                HttpResponse<String> r = send("POST", "/auth/token", "{\"user_id\":\"" + u + "\"}", Map.of());
+                if (r.statusCode() == 200) { tokens.put(u, field(r.body(), "token")); return null; }
+                if (attempt == 5) throw new IllegalStateException("token mint failed: " + r.statusCode() + " " + r.body());
+                Thread.sleep(500L * attempt);
+            }
         }).toList(), 200);
 
         // ---- burst, with an invariant watcher polling show state ----
@@ -107,7 +115,9 @@ public class Burst {
                 HttpResponse<String> resp = send("POST", "/shows/" + show + "/reserve", body,
                         Map.of("Authorization", "Bearer " + tokens.get(r.user())));
                 String rid = resp.statusCode() < 300 ? field(resp.body(), "reservation_id") : null;
-                results.add(new Res(r, resp.statusCode(), resp.statusCode() < 300 ? "ok" : field(resp.body(), "error"), rid));
+                String code = resp.statusCode() < 300 ? "ok"
+                        : resp.body().contains("\"error\"") ? field(resp.body(), "error") : "edge (not from app): " + resp.body().strip();
+                results.add(new Res(r, resp.statusCode(), code, rid));
             } catch (Exception e) {
                 netErrors.incrementAndGet();
             }
