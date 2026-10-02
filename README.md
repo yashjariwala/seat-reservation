@@ -2,7 +2,7 @@
 
 Sells assigned seats for a show without ever double-selling, exceeding a per-user limit, or double-charging a retry — under on-sale stampedes. Java 17 · Spring Boot 3 · Postgres.
 
-**Live:** `https://<your-service>.onrender.com` (free tier — first request after idle cold-starts in ~1 min; `burst.sh` waits for readiness)
+**Live:** https://seat-reservation-62kf.onrender.com (free tier — first request after idle cold-starts in ~1 min; `burst.sh` waits for readiness)
 
 Design and trade-offs: [WRITEUP.md](WRITEUP.md).
 
@@ -24,7 +24,7 @@ In VS Code: install the *Extension Pack for Java* + *Spring Boot Extension Pack*
 
 ```bash
 ./burst.sh <BASE_URL> [requests=20000] [concurrency=1000] [seats=5000]
-ADMIN_KEY=<key> ./burst.sh https://<your-service>.onrender.com
+ADMIN_KEY=<key> ./burst.sh https://seat-reservation-62kf.onrender.com
 ```
 
 Creates a fresh show, then fires concurrently: a hot-seat storm (40% of traffic on 5 seats), a per-user-limit attack (20 users × 10 parallel requests on limit 4), exact retries of in-flight requests (10%), same-key-different-seats (1%), and random traffic. Prints the outcome distribution and checks every correctness rule against both the API and `/actuator/prometheus`; exits non-zero on any failure.
