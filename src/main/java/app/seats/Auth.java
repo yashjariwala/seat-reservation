@@ -47,7 +47,7 @@ public class Auth {
     /** Returns the verified user id from an "Authorization: Bearer ..." header, or throws 401. */
     String userId(String authHeader) {
         if (authHeader == null || !authHeader.startsWith("Bearer ")) throw ApiError.unauthorized();
-        String[] parts = authHeader.substring(7).trim().split("\\.");
+        String[] parts = authHeader.substring(7).trim().split("\\.", -1);
         if (parts.length != 2) throw ApiError.unauthorized();
         try {
             String userId = new String(Base64.getUrlDecoder().decode(parts[0]), StandardCharsets.UTF_8);

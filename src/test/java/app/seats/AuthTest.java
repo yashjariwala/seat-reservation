@@ -6,6 +6,13 @@ import java.util.concurrent.*;
 import static org.assertj.core.api.Assertions.*;
 
 class AuthTest {
+    @Test void malformedTokenSuffixesCannotBeIgnored() {
+        Auth auth = new Auth("test-secret", "admin");
+        String token = auth.issue("user");
+        for (String malformed : java.util.List.of(token + ".", token + "..", "." + token, token + ".extra", "", "x", "x.y"))
+            assertThatThrownBy(() -> auth.userId("Bearer " + malformed)).isInstanceOf(ApiError.class);
+        assertThat(auth.userId("Bearer " + token)).isEqualTo("user");
+    }
     @Test void reusedSignersPreserveTokensAndRejectTamperingAcrossThreads() throws Exception {
         Auth shared = new Auth("test-secret", "admin");
         Auth independent = new Auth("test-secret", "admin");

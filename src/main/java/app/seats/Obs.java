@@ -115,15 +115,24 @@ public class Obs extends OncePerRequestFilter {
         res.setHeader("X-Request-Id", rid);
         long start = System.nanoTime();
         boolean scraping = req.getRequestURI().equals("/actuator/prometheus");
+        boolean failed = false;
         if (scraping) metricSnapshotLock.readLock().lock();
         try {
             chain.doFilter(req, res);
+        } catch (ServletException | IOException | RuntimeException e) {
+            failed = true;
+            MDC.put("error_type", e.getClass().getSimpleName());
+            throw e;
         } finally {
             if (scraping) metricSnapshotLock.readLock().unlock();
             if (!req.getRequestURI().startsWith("/actuator")) {
                 MDC.put("method", req.getMethod());
                 MDC.put("path", req.getRequestURI());
-                MDC.put("status", String.valueOf(res.getStatus()));
+                // Unhandled failures reach the container's error dispatch after this filter exits.
+                // Until then an uncommitted response still has its misleading default 200 status.
+                int status = failed && !res.isCommitted() ? 500 : res.getStatus();
+                MDC.put("status", String.valueOf(status));
+                if (failed && MDC.get("outcome") == null) MDC.put("outcome", "server_error");
                 MDC.put("duration_ms", String.valueOf((System.nanoTime() - start) / 1_000_000));
                 log.info("request");
             }

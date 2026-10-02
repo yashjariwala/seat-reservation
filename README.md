@@ -109,14 +109,33 @@ curl -s -XPOST $B/shows/$SHOW/reserve -H "Authorization: Bearer $TOKEN" -H 'cont
 
 ## Regression tests
 
-`./mvnw test` runs the runner admission/cooldown and concurrent metric scrape tests. PostgreSQL concurrency tests require a dedicated test database:
+`./mvnw test` runs unit tests. For the complete PostgreSQL suite, create a dedicated local database and enable fault injection explicitly:
 
 ```bash
 createdb seat_tests
-SEAT_TEST_DATABASE_URL=jdbc:postgresql://localhost:5432/seat_tests ./mvnw test
+SEAT_TEST_DATABASE_URL=jdbc:postgresql://localhost:5432/seat_tests SEAT_TEST_FAULTS=true ./mvnw test
 ```
 
-These tests check simultaneous initialization of a user's counter, limit declines rolling back reservation rows, multi-seat races rolling back losing counters, and concurrent idempotent replays. They create isolated shows in the supplied database; use a test database rather than the deployed database.
+Fault injection requires a loopback database URL and a database name ending in `_tests`. It installs temporary, show-scoped triggers and deliberately terminates one database connection. Those tests expect HTTP 500 during the injected failure, then verify rollback and recovery; they are not zero-error burst acceptance tests.
+
+The suite checks concurrent bookings, overlapping multi-seat requests, limits, cancellation/rebooking races, token-derived identity, lost responses, and key reuse. An independent booking model predicts randomized API outcomes, while one-statement database audits check ownership, reservation/seat links, user counters and inventory totals. The audit itself is tested against deliberately corrupted relationships.
+
+To run 10,000 model operations, or reproduce one seed:
+
+```bash
+SEAT_TEST_DATABASE_URL=jdbc:postgresql://localhost:5432/seat_tests SEAT_TEST_FAULTS=true ./mvnw -Dseat.safety.seeds=25 -Dseat.safety.steps=400 test
+SEAT_TEST_DATABASE_URL=jdbc:postgresql://localhost:5432/seat_tests ./mvnw -Dseat.safety.seed=20261002 -Dseat.safety.seeds=1 -Dseat.safety.steps=400 -Dtest=ReservationIntegrationTest#seededOperationSequencesAgreeWithIndependentBookingModel test
+```
+
+For actual process crashes and cold-start recovery:
+
+```bash
+./mvnw -DskipTests package
+python3 scripts/verify_restart.py
+```
+
+This script creates and removes its own disposable local database, launches separate JVMs on an unused local port, kills its own child process before and after commit, and checks same-key recovery after each restart. It saves a JSON report and app logs in a temporary directory printed on completion. It does not connect to the public service.
+
 
 ## Deploy (Render + Neon, both free)
 

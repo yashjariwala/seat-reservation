@@ -9,6 +9,12 @@ import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
 
 import java.sql.ResultSet;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import jakarta.servlet.ServletException;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import java.time.Duration;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -19,6 +25,36 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class ObsTest {
+    @Test void unhandledFailuresLog500AndCommittedResponsesKeepTheirActualStatus() throws Exception {
+        Logger logger = (Logger) LoggerFactory.getLogger("access");
+        var captured = new ListAppender<ILoggingEvent>() {
+            @Override protected void append(ILoggingEvent event) {
+                event.prepareForDeferredProcessing();
+                super.append(event);
+            }
+        };
+        captured.start(); logger.addAppender(captured);
+        var registry = new PrometheusMeterRegistry(PrometheusConfig.DEFAULT);
+        try {
+            Obs obs = new Obs(registry, mock(JdbcTemplate.class));
+            var request = new MockHttpServletRequest("POST", "/shows/test/reserve");
+            request.addHeader("X-Request-Id", "fault-test");
+            var response = new MockHttpServletResponse();
+            assertThatThrownBy(() -> obs.doFilter(request, response, (req, res) -> {
+                throw new ServletException("Injected failure");
+            })).isInstanceOf(ServletException.class);
+            assertThat(captured.list.get(0).getMDCPropertyMap()).containsEntry("status", "500")
+                    .containsEntry("request_id", "fault-test").containsEntry("outcome", "server_error")
+                    .containsEntry("error_type", "ServletException");
+            assertThat(MDC.getCopyOfContextMap()).isNullOrEmpty();
+
+            var committed = new MockHttpServletResponse(); committed.setStatus(201); committed.setCommitted(true);
+            assertThatThrownBy(() -> obs.doFilter(new MockHttpServletRequest("POST", "/shows/test/reserve"), committed,
+                    (req, res) -> { throw new java.io.IOException("Client disconnected after response started"); }))
+                    .isInstanceOf(java.io.IOException.class);
+            assertThat(captured.list.get(1).getMDCPropertyMap()).containsEntry("status", "201");
+        } finally { logger.detachAppender(captured); captured.stop(); registry.close(); MDC.clear(); }
+    }
     @Test void gaugesKeepTheirIdentityAndMissingStatusesBecomeZero() throws Exception {
         JdbcTemplate db = mock(JdbcTemplate.class);
         ResultSet row = mock(ResultSet.class);

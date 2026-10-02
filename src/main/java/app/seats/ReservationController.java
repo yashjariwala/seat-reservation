@@ -64,13 +64,15 @@ public class ReservationController {
         Object[] labels = seats.toArray();
         Preflight state = preflights.read(showId, userId, key, seats);
         if (state == null) throw ApiError.notFound("show not found");
+        // A persisted key binds the original request, even if the changed seats
+        // would independently be invalid or cause an amount overflow.
+        if (state.prior() != null) return replay(state.prior(), showId, seats);
         int limit = state.limit();
         if (seats.size() > limit) throw decline("per_user_limit", "would exceed per-user limit of " + limit);
         long amount;
         try { amount = Math.multiplyExact(state.price(), seats.size()); }
         catch (ArithmeticException e) { throw ApiError.badRequest("amount overflows"); }
         if (state.matched() != seats.size()) throw ApiError.badRequest("unknown seats for this show");
-        if (state.prior() != null) return replay(state.prior(), showId, seats);
         if (state.available() < seats.size())
             throw decline("seat_taken", "one or more seats are no longer available");
 
