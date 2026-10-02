@@ -6,6 +6,8 @@ Sells assigned seats for a show without ever double-selling, exceeding a per-use
 
 Design and trade-offs: [WRITEUP.md](WRITEUP.md).
 
+Latest external acceptance evidence: [LIVE-VERIFICATION.md](LIVE-VERIFICATION.md). The exact 500-buyer hot-seat test passed; the exact 20,000-buyer storm currently fails due to responses outside the reservation controller.
+
 ## Run it
 
 ```bash
@@ -35,6 +37,17 @@ Local result (M-series Mac, Postgres 16, pool of 10):
 |---|---|---|---|---|
 | 20,000 | 1,000 | 4.8 s | 0 | all pass |
 | 100,000 | 5,000 | ~10 s | 0 | all pass |
+
+## Exact single-seat storm
+
+```bash
+ADMIN_KEY=<deployed-key> java HotSeat.java https://seat-reservation-62kf.onrender.com 500
+ADMIN_KEY=<deployed-key> java HotSeat.java https://seat-reservation-62kf.onrender.com 20000
+```
+
+The harness creates a fresh show containing A12, prepares a distinct authenticated buyer and unique idempotency key for each request, warms connections, then submits every reservation asynchronously without a concurrency semaphore. It requires exactly one 201, all remaining responses to be `409 seat_taken`, zero transport/unexpected responses, and one confirmed seat in the final state. Booking requests are never retried, so edge failures cannot be hidden by recovery.
+
+It also requires the client submission span to be at most one second and prints that span separately from completion time. Client submission does not prove that all requests arrived at the server within that second: TLS, HTTP/2 flow control, the network and proxy can queue traffic. Tokens and connection warm-up are outside the measured storm. The harness can read `ADMIN_KEY` from the git-ignored `.env`; it never prints credentials. Use the mixed-workload `burst.sh` as well to test limits, idempotency and cancellation.
 
 ## Live dashboard
 
