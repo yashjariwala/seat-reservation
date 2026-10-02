@@ -19,7 +19,10 @@ import org.springframework.web.filter.OncePerRequestFilter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /** Metrics + request-scoped structured logging. */
 @Component
@@ -31,6 +34,9 @@ public class Obs extends OncePerRequestFilter {
     private final JdbcTemplate db;
     private final MultiGauge seats;
     private final MultiGauge seatsTotal;
+    // MultiGauge overwrites unregister/re-register rows. Prevent Prometheus from scraping midway
+    // through that operation (Micrometer issue #6851), and publish both families together.
+    private final ReentrantReadWriteLock metricSnapshotLock = new ReentrantReadWriteLock(true);
 
     Obs(MeterRegistry registry, JdbcTemplate db) {
         this.registry = registry;
@@ -62,16 +68,26 @@ public class Obs extends OncePerRequestFilter {
     @Scheduled(fixedDelay = 1000)
     void refreshSeatGauges() {
         List<MultiGauge.Row<?>> rows = new ArrayList<>();
-        db.query("SELECT show_id, status, count(*) AS n FROM seats GROUP BY show_id, status", rs -> {
-            rows.add(MultiGauge.Row.of(Tags.of("show_id", rs.getString("show_id"), "status", rs.getString("status")),
-                    rs.getLong("n")));
+        Map<String, Long> declared = new LinkedHashMap<>();
+        // One SQL snapshot avoids comparing old seat counts with a newly-created show's total.
+        db.query("""
+                SELECT s.id AS show_id, s.total_seats, t.status, count(t.label) AS n
+                FROM shows s LEFT JOIN seats t ON t.show_id = s.id
+                GROUP BY s.id, s.total_seats, t.status""", rs -> {
+            String showId = rs.getString("show_id");
+            declared.put(showId, rs.getLong("total_seats"));
+            String status = rs.getString("status");
+            if (status != null) rows.add(MultiGauge.Row.of(Tags.of("show_id", showId, "status", status), rs.getLong("n")));
         });
-        seats.register(rows, true);
         List<MultiGauge.Row<?>> totals = new ArrayList<>();
-        db.query("SELECT id, total_seats FROM shows", rs -> {
-            totals.add(MultiGauge.Row.of(Tags.of("show_id", rs.getString("id")), rs.getLong("total_seats")));
-        });
-        seatsTotal.register(totals, true);
+        declared.forEach((id, total) -> totals.add(MultiGauge.Row.of(Tags.of("show_id", id), total)));
+        metricSnapshotLock.writeLock().lock();
+        try {
+            seats.register(rows, true);
+            seatsTotal.register(totals, true);
+        } finally {
+            metricSnapshotLock.writeLock().unlock();
+        }
     }
 
     /** Correlation id: honour inbound X-Request-Id or mint one; echo it back; one access log line per request. */
@@ -83,9 +99,12 @@ public class Obs extends OncePerRequestFilter {
         MDC.put("request_id", rid);
         res.setHeader("X-Request-Id", rid);
         long start = System.nanoTime();
+        boolean scraping = req.getRequestURI().equals("/actuator/prometheus");
+        if (scraping) metricSnapshotLock.readLock().lock();
         try {
             chain.doFilter(req, res);
         } finally {
+            if (scraping) metricSnapshotLock.readLock().unlock();
             if (!req.getRequestURI().startsWith("/actuator")) {
                 MDC.put("method", req.getMethod());
                 MDC.put("path", req.getRequestURI());
