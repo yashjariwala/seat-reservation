@@ -21,7 +21,7 @@ public class Burst {
     record Res(Req req, int status, String code, String reservationId) {}
 
     public static void main(String[] a) {
-        try { run(a); } catch (Exception e) { e.printStackTrace(); System.exit(2); }
+        try { run(a); } catch (Throwable e) { e.printStackTrace(); System.exit(2); }
     }
 
     static void run(String[] a) throws Exception {
