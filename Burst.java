@@ -53,13 +53,15 @@ public class Burst {
         int conc = a.length > 2 ? Integer.parseInt(a[2]) : 1000;
         int nSeats = a.length > 3 ? Integer.parseInt(a[3]) : 5000;
         String adminKey = adminKey();
-        // HTTPS: HTTP/2 multiplexes the burst over a few TLS connections instead of a handshake per in-flight
-        // request (the edge resets handshake storms from one IP). Plain http (local) stays HTTP/1.1.
+        // Prefer multiplexing locally (h2c) as well as over TLS. Servers without HTTP/2 fall back to HTTP/1.1.
+        // BURST_HTTP_VERSION=1 keeps the independent-connection stress test available.
+        var version = "1".equals(System.getenv("BURST_HTTP_VERSION"))
+                ? HttpClient.Version.HTTP_1_1 : HttpClient.Version.HTTP_2;
         var exec = Executors.newFixedThreadPool(32);
         clients = new HttpClient[conc / 80 + 1];
         for (int i = 0; i < clients.length; i++)
             clients[i] = HttpClient.newBuilder()
-                    .version(base.startsWith("https") ? HttpClient.Version.HTTP_2 : HttpClient.Version.HTTP_1_1)
+                    .version(version)
                     .connectTimeout(Duration.ofSeconds(30)).executor(exec).build();
 
         System.out.printf("target=%s requests=%d concurrency=%d seats=%d%n", base, total, conc, nSeats);
@@ -127,6 +129,7 @@ public class Burst {
             CompletableFuture.allOf(warm.toArray(CompletableFuture[]::new)).join();
             if (warm.stream().anyMatch(f -> f.join().statusCode() != 200))
                 throw new IllegalStateException("Connection warm-up failed before measured burst");
+            System.out.println("Warm-up protocols: " + warm.stream().map(f -> f.join().version()).collect(Collectors.toSet()));
         }
 
         // ---- burst, with an invariant watcher polling show state ----
@@ -152,6 +155,7 @@ public class Burst {
         double submissionSpan = Double.NaN;
         List<Res> results = Collections.synchronizedList(new ArrayList<>());
         AtomicInteger netErrors = new AtomicInteger();
+        Map<String, AtomicInteger> networkReasons = new ConcurrentHashMap<>();
         if (conc >= reqs.size()) {
             // 20,000 outstanding requests use asynchronous I/O, not 20,000 platform threads.
             var requests = new ArrayList<HttpRequest>();
@@ -169,7 +173,10 @@ public class Burst {
                 Req work = reqs.get(i);
                 done.add(clients[i / 80].sendAsync(requests.get(i), HttpResponse.BodyHandlers.ofString())
                         .handle((response, error) -> {
-                            if (error != null) netErrors.incrementAndGet();
+                            if (error != null) {
+                                netErrors.incrementAndGet();
+                                recordNetworkError(networkReasons, error);
+                            }
                             else {
                                 try { results.add(result(work, response)); }
                                 catch (Exception e) { netErrors.incrementAndGet(); }
@@ -190,6 +197,7 @@ public class Burst {
                     results.add(result(r, resp));
                 } catch (Exception e) {
                     netErrors.incrementAndGet();
+                    recordNetworkError(networkReasons, e);
                 }
                 return null;
             }).toList(), conc);
@@ -203,6 +211,8 @@ public class Burst {
         results.stream().collect(Collectors.groupingBy(r -> r.status() + " " + r.code(), TreeMap::new, Collectors.counting()))
                 .forEach((k, v) -> System.out.printf("  %-32s %d%n", k, v));
         System.out.printf("  %-32s %d%n", "network errors/timeouts", netErrors.get());
+        networkReasons.entrySet().stream().sorted(Map.Entry.comparingByKey())
+                .forEach(e -> System.out.println("  network cause " + e.getKey() + " = " + e.getValue().get()));
 
         List<String> fails = new ArrayList<>();
         if (!Double.isNaN(submissionSpan))
@@ -429,6 +439,13 @@ public class Burst {
             c[i] = Integer.parseInt(m.group(1));
         }
         return c;
+    }
+
+    static void recordNetworkError(Map<String, AtomicInteger> reasons, Throwable error) {
+        Throwable root = error;
+        while (root.getCause() != null && root.getCause() != root) root = root.getCause();
+        String reason = root.getClass().getSimpleName() + ": " + root.getMessage();
+        reasons.computeIfAbsent(reason, ignored -> new AtomicInteger()).incrementAndGet();
     }
 
     static Map<String, Double> scrape() throws Exception {

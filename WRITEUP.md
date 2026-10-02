@@ -62,10 +62,10 @@ Not paged: high `seat_taken` / `per_user_limit` rates. During an on-sale those a
 The live bursts taught three things the local runs could not:
 
 - **The platform health check was the outage.** Render gives a check 5s, stops routing after 15s of failures and restarts after 60s. Under a burst on 0.1 CPU every request — the health check included — queues past 5s, so Render cut off and restarted a busy-but-correct instance (the 502s). With one instance there is nowhere else to route, so the platform check is deliberately off; a crashed process is still restarted, and `/readiness` stays for monitoring.
-- **Keep-alive must outlive the proxy's.** Tomcat closed each kept-alive connection after 100 requests; a request the proxy sent down a closing connection came back as 520/502 from the edge. Unlimited requests per connection and a 120s idle timeout fixed it.
-- **Memory is the real budget, not threads.** The JVM is capped at a 256MB heap to leave room for metaspace, stacks and socket buffers inside 512MB. Virtual threads were tried and reverted: each waiting connection then holds a Tomcat processor, and 3000 of them exhaust the heap; the 64 platform threads act as a natural bulkhead.
+- **Keep-alive needs deliberate configuration.** Earlier Tomcat versions of this application used unlimited requests per connection and a 120s keep-alive timeout to reduce connection churn. The current Undertow configuration preserves a 120s no-request timeout; public behavior must be retested after deployment.
+- **Transport allocations matter.** A local HTTP/2 storm exhausted the 256 MB heap with Tomcat, including after reducing its input windows. An OOM heap dump showed about 102 MB of 8 KB byte arrays and substantial request/header object overhead. Switching the embedded server to Undertow, with 64 workers, two I/O threads and 1 KB direct buffers, passed three local 20,000-concurrent HTTP/2 runs. A sampled run peaked near 405 MB RSS and 222 MB heap, with a separate 64 MB direct-memory cap. Local CPU was unrestricted; this is not a Render capacity result. HTTP/1.1 independent-connection storms still failed with connection resets.
 
-**The 20,000-simultaneous storm is limited by the platform, not the service — and that is measured, not assumed.** Firing 20,000 requests at once at `/actuator/health/liveness`, an endpoint with no database call and no request body, fails the same way the reserve storm does:
+**Public overload failures also occur without reservation work.** In an earlier deployment, firing 20,000 requests at once at `/actuator/health/liveness`, an endpoint with no database call and no request body, produced these results:
 
 | Endpoint | Requests at once | Result |
 |---|---|---|
@@ -73,7 +73,7 @@ The live bursts taught three things the local runs could not:
 | `/actuator/health/liveness` | 20,000 | 11,959 × 200, 7,132 × 429, 908 × 502, 1 × 520 |
 | `/shows/{id}/reserve` (one hot seat) | 20,000 | 1 × 201, 8,733 × 409, 10,685 × 429, 560 × 502, 1 × 520 |
 
-The no-op endpoint served about 2.3× more requests per second than reserve (~208/s vs ~92/s) and still lost 40% of the storm to the edge, which answers the excess with 429/502 before it reaches the application. So reservation cost affects throughput, but it is not what fails the test: even a request that costs nothing does not get 20,000 clean answers on a 0.1-CPU instance behind Render's edge. The application's own 5xx count stayed at zero, and correctness held in every run (one winner per seat, no double-sell, reconciliation intact). Passing the full storm needs more capacity than the free tier provides (a larger instance, or a host without a rate-limiting edge); keeping hosting free was a deliberate constraint. Full numbers: [LIVE-VERIFICATION.md](LIVE-VERIFICATION.md).
+The no-op endpoint served about 2.3× more requests per second than reserve (~208/s vs ~92/s) but still lost about 40% of its storm to non-domain responses. These observations show that booking database work is not the only bottleneck. They do not prove an absolute ceiling or that application changes cannot improve delivery. App metrics did not count the received public 5xx responses; observed uniqueness and final reconciliation held, but failed inventory reads prevented complete observation during some bursts. The full public acceptance bar remains unmet; the local transport optimization has not yet been deployed. Full numbers: [LIVE-VERIFICATION.md](LIVE-VERIFICATION.md).
 
 ## AI usage
 

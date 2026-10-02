@@ -14,4 +14,5 @@ EXPOSE 8080
 # trim native memory; serial GC and C1-only JIT keep GC/compiler threads off the CPU the requests need.
 ENV MALLOC_ARENA_MAX=2
 ENTRYPOINT ["java", "-XX:MaxRAMPercentage=50", "-Xss512k", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=48m", \
+            "-XX:MaxDirectMemorySize=64m", \
             "-XX:+UseSerialGC", "-XX:TieredStopAtLevel=1", "-XX:+ExitOnOutOfMemoryError", "-jar", "app.jar"]

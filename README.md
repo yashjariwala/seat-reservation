@@ -49,6 +49,18 @@ The harness creates a fresh show containing A12, prepares a distinct authenticat
 
 It also requires the client submission span to be at most one second and prints that span separately from completion time. Client submission does not prove that all requests arrived at the server within that second: TLS, HTTP/2 flow control, the network and proxy can queue traffic. Tokens and connection warm-up are outside the measured storm. The harness can read `ADMIN_KEY` from the git-ignored `.env`; it never prints credentials. Use the mixed-workload `burst.sh` as well to test limits, idempotency and cancellation. With `ADMIN_KEY` in `.env`, run `./burst.sh https://seat-reservation-62kf.onrender.com 20000 20000 5000` to dispatch all 20,000 mixed reservations together using asynchronous I/O. The default 1,000-concurrency run is a bounded workload and does not establish the full simultaneous bar. The tool warms connections first, reports client submission span separately, rejects non-domain responses, and reports failed inventory polls rather than treating missing counts as zero.
 
+## Local simultaneous verification
+
+With Java 17+, Python 3 and a running local PostgreSQL (including `createdb`, `dropdb` and `ps`), run:
+
+```bash
+python3 scripts/verify_local_burst.py
+```
+
+This builds the current code, starts its own JVM with a 256 MB heap and 64 MB direct-memory cap, creates a disposable loopback database, and dispatches 20,000 mixed reservations at 20,000 concurrency. It saves app/build/burst logs and sampled memory measurements, then removes its own database and server. It does not contact the live deployment or limit CPU to Render's quota.
+
+The server uses Undertow with 64 workers, two I/O threads and 1 KB pooled direct buffers. The burst prefers HTTP/2, including cleartext HTTP/2 locally, and prints the negotiated warm-up protocol. Set `BURST_HTTP_VERSION=1` to test HTTP/1.1 separately; the local independent-connection storm currently fails with connection resets. A multiplexed HTTP/2 pass does not establish an HTTP/1.1 pass. Reservation requests are never retried, and transport failures still fail the test.
+
 ## Live dashboard
 
 Open `/` to view live health, throughput, latency, reservation outcomes and seat reconciliation. The **Start burst** button creates a fresh show and runs one of two fixed presets:
