@@ -39,3 +39,7 @@ CREATE TABLE IF NOT EXISTS user_counts (
     seat_count INT  NOT NULL DEFAULT 0 CHECK (seat_count >= 0),
     PRIMARY KEY (show_id, user_id)
 );
+
+-- Seat count as declared at creation: the independent side of the reconciliation check.
+ALTER TABLE shows ADD COLUMN IF NOT EXISTS total_seats INT;
+UPDATE shows s SET total_seats = (SELECT count(*) FROM seats WHERE show_id = s.id) WHERE total_seats IS NULL;

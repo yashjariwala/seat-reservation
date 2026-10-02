@@ -41,8 +41,8 @@ public class ShowController {
         if (limit < 1) throw ApiError.badRequest("per_user_limit must be >= 1");
 
         UUID id = UUID.randomUUID();
-        db.update("INSERT INTO shows (id, name, price_paise, per_user_limit) VALUES (?, ?, ?, ?)",
-                id, req.name(), req.pricePaise(), limit);
+        db.update("INSERT INTO shows (id, name, price_paise, per_user_limit, total_seats) VALUES (?, ?, ?, ?, ?)",
+                id, req.name(), req.pricePaise(), limit, req.seats().size());
         db.update(con -> {
             var ps = con.prepareStatement("INSERT INTO seats (show_id, label) SELECT ?, unnest(?::text[])");
             ps.setObject(1, id);

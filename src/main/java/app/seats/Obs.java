@@ -30,11 +30,13 @@ public class Obs extends OncePerRequestFilter {
     private final MeterRegistry registry;
     private final JdbcTemplate db;
     private final MultiGauge seats;
+    private final MultiGauge seatsTotal;
 
     Obs(MeterRegistry registry, JdbcTemplate db) {
         this.registry = registry;
         this.db = db;
         this.seats = MultiGauge.builder("seats").description("Seats per show by status").register(registry);
+        this.seatsTotal = MultiGauge.builder("seats_declared").description("Seats declared at show creation").register(registry);
     }
 
     void confirmed() {
@@ -56,7 +58,7 @@ public class Obs extends OncePerRequestFilter {
         });
     }
 
-    /** seats{show_id, status} straight from the source of truth. ponytail: 1s lag; fine for watching a burst. */
+    /** seats{show_id, status} + seats_declared{show_id}: their sum must match (reconciliation). ponytail: 1s lag; fine for watching a burst. */
     @Scheduled(fixedDelay = 1000)
     void refreshSeatGauges() {
         List<MultiGauge.Row<?>> rows = new ArrayList<>();
@@ -65,6 +67,11 @@ public class Obs extends OncePerRequestFilter {
                     rs.getLong("n")));
         });
         seats.register(rows, true);
+        List<MultiGauge.Row<?>> totals = new ArrayList<>();
+        db.query("SELECT id, total_seats FROM shows", rs -> {
+            totals.add(MultiGauge.Row.of(Tags.of("show_id", rs.getString("id")), rs.getLong("total_seats")));
+        });
+        seatsTotal.register(totals, true);
     }
 
     /** Correlation id: honour inbound X-Request-Id or mint one; echo it back; one access log line per request. */
