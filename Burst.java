@@ -14,7 +14,11 @@ import java.util.stream.*;
  */
 public class Burst {
     static final int HOT_SEATS = 5, LIMIT = 4, LIMIT_USERS = 20, LIMIT_FIRES = 10;
-    static HttpClient http;
+    static HttpClient[] clients;
+    static final AtomicInteger nextClient = new AtomicInteger();
+    // Each worker thread sticks to one client; ~80 threads per client keeps every HTTP/2 connection under the
+    // edge's ~100 concurrent-stream cap (the JDK client errors instead of opening a second connection).
+    static final ThreadLocal<HttpClient> http = ThreadLocal.withInitial(() -> clients[nextClient.getAndIncrement() % clients.length]);
     static String base;
 
     record Req(String user, String key, List<String> seats, String kind) {}
@@ -32,10 +36,12 @@ public class Burst {
         String adminKey = Optional.ofNullable(System.getenv("ADMIN_KEY")).orElse("dev-admin-key");
         // HTTPS: HTTP/2 multiplexes the burst over a few TLS connections instead of a handshake per in-flight
         // request (the edge resets handshake storms from one IP). Plain http (local) stays HTTP/1.1.
-        http = HttpClient.newBuilder()
-                .version(base.startsWith("https") ? HttpClient.Version.HTTP_2 : HttpClient.Version.HTTP_1_1)
-                .connectTimeout(Duration.ofSeconds(30))
-                .executor(Executors.newFixedThreadPool(32)).build();
+        var exec = Executors.newFixedThreadPool(32);
+        clients = new HttpClient[conc / 80 + 1];
+        for (int i = 0; i < clients.length; i++)
+            clients[i] = HttpClient.newBuilder()
+                    .version(base.startsWith("https") ? HttpClient.Version.HTTP_2 : HttpClient.Version.HTTP_1_1)
+                    .connectTimeout(Duration.ofSeconds(30)).executor(exec).build();
 
         System.out.printf("target=%s requests=%d concurrency=%d seats=%d%n", base, total, conc, nSeats);
         waitReady();
@@ -326,7 +332,7 @@ public class Burst {
     }
 
     static HttpResponse<String> get(String path) throws Exception {
-        return http.send(HttpRequest.newBuilder(URI.create(base + path)).timeout(Duration.ofSeconds(60)).build(),
+        return http.get().send(HttpRequest.newBuilder(URI.create(base + path)).timeout(Duration.ofSeconds(60)).build(),
                 HttpResponse.BodyHandlers.ofString());
     }
 
@@ -334,7 +340,7 @@ public class Burst {
         var b = HttpRequest.newBuilder(URI.create(base + path)).timeout(Duration.ofSeconds(180))
                 .header("Content-Type", "application/json").method(method, HttpRequest.BodyPublishers.ofString(json));
         headers.forEach(b::header);
-        return http.send(b.build(), HttpResponse.BodyHandlers.ofString());
+        return http.get().send(b.build(), HttpResponse.BodyHandlers.ofString());
     }
 
     static String field(String json, String name) {
