@@ -1,0 +1,129 @@
+show=1813fe6d-7a9b-473f-8b37-1b9b82d33a41
+minting 4429 tokens...
+Warm-up protocols: [HTTP_2]
+firing 20000 reserve requests...
+submission_span_seconds=0.146 (client dispatch; arrival timing not verified)
+
+done in 155.8s (128 req/s)
+
+Outcome distribution:
+  200 ok                           352
+  201 ok                           3295
+  409 idempotency_key_reused       52
+  409 per_user_limit               177
+  409 seat_taken                   11319
+  503 non-domain response          4805
+  network errors/timeouts          0
+  PASS  all requests dispatched within one second (0.146275375 s)
+  FAIL  zero 5xx (got 4805)
+  PASS  zero network errors (got 0)
+  FAIL  only successful/replayed reservations or domain declines (unexpected=4805)
+  PASS  hot seat A1: exactly one 201 (got 1, 409s=1337)
+  PASS  hot seat A2: exactly one 201 (got 1, 409s=1354)
+  PASS  hot seat A3: exactly one 201 (got 1, 409s=1340)
+  PASS  hot seat A4: exactly one 201 (got 1, 409s=1359)
+  PASS  hot seat A5: exactly one 201 (got 1, 409s=1382)
+  PASS  no seat confirmed twice (double-sold=0)
+  PASS  per-user limit across all users (max held=4)
+  PASS  limit attack: 10 parallel on limit=4 (max held=4)
+  PASS  idempotency: one reservation per key (keys with >1 reservation=0, >1 201s=0)
+  PASS  same key + different seats never both succeed (keys=0, 409 reused=52)
+
+Final show state: available=1209 held=0 confirmed=3791 total=5000
+  PASS  reconciliation: available+held+confirmed == total
+  PASS  confirmed seats (3791) == seats in 201 responses (3791)
+  FAIL  invariant observed during burst (2 polls, failed reads=3, violations=0)
+  PASS  metric reservations_confirmed_total delta (3295) == 201s (3295)
+  PASS  metric declined{seat_taken} delta (11319) == API (11319)
+  PASS  metric declined{per_user_limit} delta (177) == API (177)
+  PASS  metric declined{idempotent_replay} delta (352) == API (352)
+  PASS  metric declined{idempotency_key_reused} delta (52) == API (52)
+  PASS  gauge seats{available} (1209) == API (1209)
+  PASS  gauge seats{held} (0) == API (0)
+  PASS  gauge seats{confirmed} (3791) == API (3791)
+
+Phase 2: 200 victims -> 1200 concurrent cancel/attack/rebook requests
+  attacker_cancel 404              200
+  owner_cancel 200                 400
+  rebook 201                       180
+  rebook 409                       420
+  PASS  phase 2: zero 5xx (got 0)
+  PASS  cancel someone else's reservation -> 404 (non-404s=0)
+  PASS  owner double-cancel: both 200 cancelled (bad=0)
+  PASS  spoofed body user_id ignored: every 201 is the token's user (violations=0)
+  PASS  freed seats rebooked by at most one user each (victims with >1 winner=0)
+  rebooked during race: 180 of 200 victims; guaranteed rebook after cancel: 20
+  PASS  post-cancel rebook succeeds as the token's user, spoof ignored (bad=0 of 20)
+  final available=1209 held=0 confirmed=3791 total=5000
+  PASS  every cancelled seat ended confirmed to exactly one rebooker (not confirmed=0)
+  PASS  confirmed after phase 2 (3791) == before (3791): every cancel matched by one rebook
+  PASS  reconciliation after phase 2: available+held+confirmed == total
+
+FAILED: 3 check(s)
+yashjariwala@Yashs-MacBook-Air seat-reservation % clear
+
+yashjariwala@Yashs-MacBook-Air seat-reservation % ./burst.sh https://p01--seat-reservation--tc65zqzsjs45.code.run 20000 20000 5000
+target=https://p01--seat-reservation--tc65zqzsjs45.code.run requests=20000 concurrency=20000 seats=5000
+show=e9c69e3f-629d-4d38-b5db-4d191a1af9da
+minting 4429 tokens...
+Warm-up protocols: [HTTP_2]
+firing 20000 reserve requests...
+submission_span_seconds=0.114 (client dispatch; arrival timing not verified)
+
+done in 79.1s (253 req/s)
+
+Outcome distribution:
+  200 ok                           309
+  201 ok                           3197
+  409 idempotency_key_reused       46
+  409 per_user_limit               175
+  409 seat_taken                   10457
+  503 non-domain response          5816
+  network errors/timeouts          0
+  PASS  all requests dispatched within one second (0.114230166 s)
+  FAIL  zero 5xx (got 5816)
+  PASS  zero network errors (got 0)
+  FAIL  only successful/replayed reservations or domain declines (unexpected=5816)
+  PASS  hot seat A1: exactly one 201 (got 1, 409s=1256)
+  PASS  hot seat A2: exactly one 201 (got 1, 409s=1253)
+  PASS  hot seat A3: exactly one 201 (got 1, 409s=1250)
+  PASS  hot seat A4: exactly one 201 (got 1, 409s=1251)
+  PASS  hot seat A5: exactly one 201 (got 1, 409s=1308)
+  PASS  no seat confirmed twice (double-sold=0)
+  PASS  per-user limit across all users (max held=4)
+  PASS  limit attack: 10 parallel on limit=4 (max held=4)
+  PASS  idempotency: one reservation per key (keys with >1 reservation=0, >1 201s=0)
+  PASS  same key + different seats never both succeed (keys=0, 409 reused=46)
+
+Final show state: available=1319 held=0 confirmed=3681 total=5000
+  PASS  reconciliation: available+held+confirmed == total
+  PASS  confirmed seats (3681) == seats in 201 responses (3681)
+  FAIL  invariant observed during burst (3 polls, failed reads=2, violations=0)
+  PASS  metric reservations_confirmed_total delta (3197) == 201s (3197)
+  PASS  metric declined{seat_taken} delta (10457) == API (10457)
+  PASS  metric declined{per_user_limit} delta (175) == API (175)
+  PASS  metric declined{idempotent_replay} delta (309) == API (309)
+  PASS  metric declined{idempotency_key_reused} delta (46) == API (46)
+  PASS  gauge seats{available} (1319) == API (1319)
+  PASS  gauge seats{held} (0) == API (0)
+  PASS  gauge seats{confirmed} (3681) == API (3681)
+
+Phase 2: 200 victims -> 1200 concurrent cancel/attack/rebook requests
+  attacker_cancel 404              200
+  owner_cancel 200                 400
+  rebook 201                       181
+  rebook 409                       419
+  PASS  phase 2: zero 5xx (got 0)
+  PASS  cancel someone else's reservation -> 404 (non-404s=0)
+  PASS  owner double-cancel: both 200 cancelled (bad=0)
+  PASS  spoofed body user_id ignored: every 201 is the token's user (violations=0)
+  PASS  freed seats rebooked by at most one user each (victims with >1 winner=0)
+  rebooked during race: 181 of 200 victims; guaranteed rebook after cancel: 19
+  PASS  post-cancel rebook succeeds as the token's user, spoof ignored (bad=0 of 19)
+  final available=1319 held=0 confirmed=3681 total=5000
+  PASS  every cancelled seat ended confirmed to exactly one rebooker (not confirmed=0)
+  PASS  confirmed after phase 2 (3681) == before (3681): every cancel matched by one rebook
+  PASS  reconciliation after phase 2: available+held+confirmed == total
+
+FAILED: 3 check(s)
+yashjariwala@Yashs-MacBook-Air seat-reservation % 

@@ -1,4 +1,33 @@
-# Live acceptance verification — 2026-10-02
+# Live acceptance verification — current status, 2026-10-03
+
+Primary URL: https://p01--seat-reservation--tc65zqzsjs45.code.run/
+
+Northflank Sandbox application: 0.2 shared vCPU / 512 MB; private PostgreSQL 18 in the same project. Latest published code includes the transport optimization; documentation/UI changes do not convert a failing external test into a pass.
+
+## Latest user-run public workload
+
+20,000 requests, 20,000 concurrency, 5,000 seats; show `e9c69e3f-629d-4d38-b5db-4d191a1af9da`. Client dispatch: 0.114 s; reserve completion: 79.1 s. Client dispatch is not verified arrival timing.
+
+| Response | Count |
+|---|---:|
+| 200 replay | 309 |
+| 201 confirmed reservation | 3,197 |
+| 409 key reused | 46 |
+| 409 per-user limit | 175 |
+| 409 seat taken | 10,457 |
+| 503 non-domain response | 5,816 |
+| Network errors | 0 |
+
+**Overall: FAIL (three checks).** Zero 5xx and only-domain responses fail. During-burst inventory observation also fails: three successful polls, two failed reads, zero observed violations. Missing observations are not evidence of invariant preservation throughout the burst.
+
+Final inventory: available=1,319, held=0, confirmed=3,681, total=5,000. Observed single hot-seat winners, no double sale, per-user limit, idempotency, final reconciliation and metric comparisons passed. Phase 2 passed owner-only cancellation, spoofed identity, double cancellation and exactly one eventual rebooker per freed seat. A reservation can contain multiple seats, hence 3,197 new reservations versus 3,681 confirmed seats.
+
+The preceding Northflank/remote-Neon run took 155.8 s and returned 4,805 HTTP 503s. The next co-located database run was faster but still failed. The precise cause of the latest public 503s has not been established for each request. Earlier worker queue and CPU-throttling samples indicate saturation; provider-level and application-level failures require separate evidence.
+
+Raw reported test output, local passing output and structured log samples: [evidence/README.md](evidence/README.md). No failing reservation response is retried or excluded from the acceptance result.
+
+## Historical Render evidence — 2026-10-02
+
 
 Target: https://seat-reservation-62kf.onrender.com/  
 Application commit under test: `bd1924ea069d6cb28a9b9bb5643496c0b773c46a`  

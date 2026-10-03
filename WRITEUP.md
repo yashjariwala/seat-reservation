@@ -52,42 +52,34 @@ Postgres is the only source of truth, and the system chooses **consistency**. If
 
 - **Any sustained 5xx** (`http_server_requests_seconds_count{status=~"5.."}`) — by design every domain outcome is 4xx, so 5xx means a real fault.
 - **Readiness failing** — DB unreachable; sales are stopped.
-- **Invariant drift** — `sum(seats{show_id=X})` ≠ the show's total, or `reservations_confirmed_total` diverging from confirmed rows. Should be impossible; if it fires, stop sales.
+- **Invariant drift** — `sum(seats{show_id=X})` ≠ the show's total, or a seat gauge disagreeing with a consistent API inventory snapshot. Confirmation counter deltas must match new 201 responses; cumulative counters cannot be compared directly with net inventory after cancellations or process restarts. Should be impossible; if it fires, stop sales.
 - **Latency / saturation** — p99 reserve latency and `hikaricp_connections_pending` climbing: requests queuing for DB connections. Usually the precursor to timeouts.
 
 Not paged: high `seat_taken` / `per_user_limit` rates. During an on-sale those are the expected outcome.
 
-## Running it on a 0.1-CPU free tier
+## Deployment limits and acceptance status
 
-The live bursts taught three things the local runs could not:
+The primary deployment is Northflank Sandbox: the application has 0.2 shared vCPU and 512 MB RAM, with a private PostgreSQL 18 add-on in the same project. The latest public test dispatched 20,000 reservations at 20,000 concurrency in 0.114 seconds. It completed reservations in 79.1 seconds but received 5,816 HTTP 503 responses. Inventory observation had three successful polls and two failed reads. **The full public correctness bar remains unmet.** Client dispatch timing does not establish server arrival timing.
 
-- **The platform health check was the outage.** Render gives a check 5s, stops routing after 15s of failures and restarts after 60s. Under a burst on 0.1 CPU every request — the health check included — queues past 5s, so Render cut off and restarted a busy-but-correct instance (the 502s). With one instance there is nowhere else to route, so the platform check is deliberately off; a crashed process is still restarted, and `/readiness` stays for monitoring.
-- **Keep-alive needs deliberate configuration.** Earlier Tomcat versions of this application used unlimited requests per connection and a 120s keep-alive timeout to reduce connection churn. The current Undertow configuration preserves a 120s no-request timeout; public behavior must be retested after deployment.
-- **Transport allocations matter.** A local HTTP/2 storm exhausted the 256 MB heap with Tomcat, including after reducing its input windows. An OOM heap dump showed about 102 MB of 8 KB byte arrays and substantial request/header object overhead. Switching the embedded server to Undertow, with 64 workers, two I/O threads and 1 KB direct buffers, passed three local 20,000-concurrent HTTP/2 runs. A sampled run peaked near 405 MB RSS and 222 MB heap, with a separate 64 MB direct-memory cap. Local CPU was unrestricted; this is not a Render capacity result. HTTP/1.1 independent-connection storms still failed with connection resets.
+Observed hot-seat winners, ownership, per-user limits, idempotency, final reconciliation, metrics comparisons and cancellation/rebooking checks passed. This does not turn the overall run into a pass: some losing buyers received 503 rather than 409, and observation gaps prevent a complete during-burst claim.
 
-**Public overload failures also occur without reservation work.** In an earlier deployment, firing 20,000 requests at once at `/actuator/health/liveness`, an endpoint with no database call and no request body, produced these results:
+An earlier Northflank run against remote Neon took 155.8 seconds and received 4,805 HTTP 503 responses. Moving PostgreSQL into the hosting project reduced completion time in the next reported run, but did not eliminate failures. This is one before/after observation, not a controlled capacity benchmark. Earlier resource samples showed CPU throttling and an HTTP worker backlog with memory headroom. These are signs of saturation; they do not prove CPU is the sole cause of every public 503 or establish the proxy's precise rejection policy.
 
-| Endpoint | Requests at once | Result |
-|---|---|---|
-| `/actuator/health/liveness` | 2,000 | 2,000 × 200 |
-| `/actuator/health/liveness` | 20,000 | 11,959 × 200, 7,132 × 429, 908 × 502, 1 × 520 |
-| `/shows/{id}/reserve` (one hot seat) | 20,000 | 1 × 201, 8,733 × 409, 10,685 × 429, 560 × 502, 1 × 520 |
+Locally, the 20,000-concurrent HTTP/2 workload passed with a 256 MB heap; Docker runs with a 512 MB application limit also passed at one and two CPUs. These local CPU allocations differ from the public free tier. The PostgreSQL regression suite previously passed all 22 tests, including rollback and injected-failure recovery. A multiplexed HTTP/2 pass does not establish an independent-connection HTTP/1.1 pass.
 
-The no-op endpoint served about 2.3× more requests per second than reserve (~208/s vs ~92/s) but still lost about 40% of its storm to non-domain responses. These observations show that booking database work is not the only bottleneck. They do not prove an absolute ceiling or that application changes cannot improve delivery. App metrics did not count the received public 5xx responses; observed uniqueness and final reconciliation held, but failed inventory reads prevented complete observation during some bursts. The full public acceptance bar remains unmet; the local transport optimization has not yet been deployed. Full numbers: [LIVE-VERIFICATION.md](LIVE-VERIFICATION.md).
+The transport uses Undertow with 64 workers, two I/O threads, small direct buffers and request-body buffering before worker dispatch. The application still returns final 201/409 decisions; a 202 queue acknowledgement would change the required API rather than satisfy it. Detailed results and public captured logs: [LIVE-VERIFICATION.md](LIVE-VERIFICATION.md), [evidence](evidence/README.md).
 
 ## AI usage
 
-> **TODO (Yash): rewrite this section in your own words before submitting.** Facts to start from are below.
+AI assistance was substantial: implementation, review, regression tests, load tools, documentation and deployment diagnosis. The earlier repository write-up attributes the initial build to Claude Code; subsequent fixes and submission preparation used Codex. This disclosure does not claim that the author manually wrote every line.
 
-- Built with Claude Code (Claude Opus). I set the stack (Java/Spring), the 5× load target (100k requests), and reviewed each step; Claude proposed the schema, the three-gate transaction and lock ordering, wrote most of the code, the burst tool and these docs.
-- Things caught during the build: the first package name `in.seats` is illegal in Java (`in` is a keyword); the burst's key-reuse check initially assumed the original request always arrives first, which is wrong under concurrency; a `seats_total` gauge silently vanished (Prometheus reserves `_total` for counters); the status page's first invariant check compared a total to itself; capping Tomcat connections caused refused sockets; virtual threads OOM'd the heap.
-- Independent review (run separately and fed back in): found the comma-joined idempotency hash collision, open token minting, a null-seat 500, unchecked amount overflow, a missing cancel index, `total_seats` derived from the rows it should check, and a rebook test that could pass vacuously. All fixed and covered by the burst.
-- What I verified myself: _(fill in — e.g. the break-it experiments: removing `AND status='available'`, removing `ORDER BY label`, replacing the guarded counter upsert with SELECT-then-UPDATE, and what the burst showed for each)_.
+Human direction included the Java stack, the assignment's atomic correctness requirements, zero-cost hosting, authorization of deployment changes, and running and sharing the public CLI test results. AI proposed implementation details including database booking gates, deterministic lock ordering, batched preflight reads, stable metric registration, transport tuning and co-located PostgreSQL. Tests and operational evidence informed those changes; the remaining public failures are disclosed rather than treated as successful domain declines.
+
+Reviews identified ambiguous idempotency comparisons, token-minting access control, invalid-input handling, amount overflow, reconciliation checks and cancellation/rebooking test coverage. The author should be able to explain and defend the implementation and the limits of its evidence; no unperformed manual fault experiment is claimed here.
 
 ## What I'd do next
 
-- Hold + confirm with expiry (above), and a payment step that confirms by reservation id.
-- Load test the deployed instance at higher concurrency and size the DB pool against the provider's connection limit.
-- Real auth (IdP-issued JWT with expiry) instead of the admin-issued HMAC token.
-- Integration tests (Testcontainers Postgres) for the single-request rules, so the burst isn't the only automated check.
-- Alerting rules checked into the repo alongside the metrics.
+- Diagnose public 503s with correlated ingress and application request IDs, then validate the exact external workload again without retries that hide failures.
+- Automate the existing real-PostgreSQL regression and restart tests in CI.
+- Add alerting for external failure rate, inventory drift, readiness and saturation.
+- If the product requires payment holds, add explicit hold/confirm/expiry transitions and an expiring identity-provider token. These are future features, not current behavior.

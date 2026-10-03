@@ -1,12 +1,12 @@
 # Seat Reservation at Scale
 
-Sells assigned seats for a show without ever double-selling, exceeding a per-user limit, or double-charging a retry — under on-sale stampedes. Java 17 · Spring Boot 3 · Postgres.
+Atomically reserves assigned seats, enforces per-user limits, and replays idempotent retries. No payment gateway is implemented. Java 17 · Spring Boot 3 · Postgres.
 
-**Live:** https://seat-reservation-62kf.onrender.com (free tier — first request after idle cold-starts in ~1 min; `burst.sh` waits for readiness)
+**Live:** https://p01--seat-reservation--tc65zqzsjs45.code.run (Northflank Sandbox: 0.2 shared vCPU / 512 MB application, private PostgreSQL 18; `burst.sh` waits for readiness)
 
 Design and trade-offs: [WRITEUP.md](WRITEUP.md).
 
-Latest external acceptance evidence: [LIVE-VERIFICATION.md](LIVE-VERIFICATION.md). The exact 500-buyer hot-seat test passed; the exact 20,000-buyer storm currently fails due to responses outside the reservation controller.
+Latest external acceptance evidence: [LIVE-VERIFICATION.md](LIVE-VERIFICATION.md). The local 20,000-concurrent HTTP/2 test passes. The latest public 20,000-concurrent test **fails**: 5,816 HTTP 503 responses and incomplete inventory observation. The full assignment acceptance bar is not yet met. Public test output and structured log evidence are in [evidence/](evidence/README.md).
 
 ## Run it
 
@@ -26,28 +26,32 @@ In VS Code: install the *Extension Pack for Java* + *Spring Boot Extension Pack*
 
 ```bash
 ./burst.sh <BASE_URL> [requests=20000] [concurrency=1000] [seats=5000]
-ADMIN_KEY=<key> ./burst.sh https://seat-reservation-62kf.onrender.com
+ADMIN_KEY=<key> ./burst.sh https://p01--seat-reservation--tc65zqzsjs45.code.run 20000 20000 5000
 ```
 
 Creates a fresh show, then fires concurrently: a hot-seat storm (40% of traffic on 5 seats), a per-user-limit attack (20 users × 10 parallel requests on limit 4), exact retries of in-flight requests (10%), same-key-different-seats (1%), and random traffic. Then phase 2: for 200 confirmed reservations, concurrently, the owner cancels twice, an attacker tries to cancel, and three other users try to rebook the freed seats with `"user_id": <owner>` spoofed in the body. Prints the outcome distribution and checks every correctness rule against both the API and `/actuator/prometheus`; exits non-zero on any failure.
 
-Local result (M-series Mac, Postgres 16, pool of 10):
+Verified local HTTP/2 results (not a prediction of free-tier capacity):
 
-| requests | concurrency | time | 5xx | checks |
-|---|---|---|---|---|
-| 20,000 | 1,000 | 4.8 s | 0 | all pass |
-| 100,000 | 5,000 | ~10 s | 0 | all pass |
+| Environment | Requests / concurrency | Reservation completion | Result |
+|---|---|---|---|
+| Mac, unrestricted CPU, 256 MB JVM heap | 20,000 / 20,000 | 4.8 s | All checks pass |
+| Docker, 1 CPU / 512 MB app | 20,000 / 20,000 | 7.3 s | All checks pass |
+| Docker, 2 CPUs / 512 MB app | 20,000 / 20,000 | 4.2 s | All checks pass |
+| Public Northflank Sandbox, private Postgres | 20,000 / 20,000 | 79.1 s | Three checks fail |
+
+The completion rate includes declines; it is not successful bookings per second. See [verification](LIVE-VERIFICATION.md) for outcomes and observation gaps.
 
 ## Exact single-seat storm
 
 ```bash
-ADMIN_KEY=<deployed-key> java HotSeat.java https://seat-reservation-62kf.onrender.com 500
-ADMIN_KEY=<deployed-key> java HotSeat.java https://seat-reservation-62kf.onrender.com 20000
+ADMIN_KEY=<deployed-key> java HotSeat.java https://p01--seat-reservation--tc65zqzsjs45.code.run 500
+ADMIN_KEY=<deployed-key> java HotSeat.java https://p01--seat-reservation--tc65zqzsjs45.code.run 20000
 ```
 
 The harness creates a fresh show containing A12, prepares a distinct authenticated buyer and unique idempotency key for each request, warms connections, then submits every reservation asynchronously without a concurrency semaphore. It requires exactly one 201, all remaining responses to be `409 seat_taken`, zero transport/unexpected responses, and one confirmed seat in the final state. Booking requests are never retried, so edge failures cannot be hidden by recovery.
 
-It also requires the client submission span to be at most one second and prints that span separately from completion time. Client submission does not prove that all requests arrived at the server within that second: TLS, HTTP/2 flow control, the network and proxy can queue traffic. Tokens and connection warm-up are outside the measured storm. The harness can read `ADMIN_KEY` from the git-ignored `.env`; it never prints credentials. Use the mixed-workload `burst.sh` as well to test limits, idempotency and cancellation. With `ADMIN_KEY` in `.env`, run `./burst.sh https://seat-reservation-62kf.onrender.com 20000 20000 5000` to dispatch all 20,000 mixed reservations together using asynchronous I/O. The default 1,000-concurrency run is a bounded workload and does not establish the full simultaneous bar. The tool warms connections first, reports client submission span separately, rejects non-domain responses, and reports failed inventory polls rather than treating missing counts as zero.
+It also requires the client submission span to be at most one second and prints that span separately from completion time. Client submission does not prove that all requests arrived at the server within that second: TLS, HTTP/2 flow control, the network and proxy can queue traffic. Tokens and connection warm-up are outside the measured storm. The harness can read `ADMIN_KEY` from the git-ignored `.env`; it never prints credentials. Use the mixed-workload `burst.sh` as well to test limits, idempotency and cancellation. With `ADMIN_KEY` in `.env`, run `./burst.sh https://p01--seat-reservation--tc65zqzsjs45.code.run 20000 20000 5000` to dispatch all 20,000 mixed reservations together using asynchronous I/O. The default 1,000-concurrency run is a bounded workload and does not establish the full simultaneous bar. The tool warms connections first, reports client submission span separately, rejects non-domain responses, and reports failed inventory polls rather than treating missing counts as zero.
 
 ## Local simultaneous verification
 
@@ -57,24 +61,24 @@ With Java 17+, Python 3 and a running local PostgreSQL (including `createdb`, `d
 python3 scripts/verify_local_burst.py
 ```
 
-This builds the current code, starts its own JVM with a 256 MB heap and 64 MB direct-memory cap, creates a disposable loopback database, and dispatches 20,000 mixed reservations at 20,000 concurrency. It saves app/build/burst logs and sampled memory measurements, then removes its own database and server. It does not contact the live deployment or limit CPU to Render's quota.
+This builds the current code, starts its own JVM with a 256 MB heap and 64 MB direct-memory cap, creates a disposable loopback database, and dispatches 20,000 mixed reservations at 20,000 concurrency. It saves app/build/burst logs and sampled memory measurements, then removes its own database and server. It does not contact the live deployment or limit CPU to the public free-tier allocation.
 
 The server uses Undertow with 64 workers, two I/O threads and 1 KB pooled direct buffers. The burst prefers HTTP/2, including cleartext HTTP/2 locally, and prints the negotiated warm-up protocol. Set `BURST_HTTP_VERSION=1` to test HTTP/1.1 separately; the local independent-connection storm currently fails with connection resets. A multiplexed HTTP/2 pass does not establish an HTTP/1.1 pass. Reservation requests are never retried, and transport failures still fail the test.
 
 ## Live dashboard
 
-Open `/` to view live health, throughput, latency, reservation outcomes and seat reconciliation. The **Start burst** button creates a fresh show and runs one of two fixed presets:
+Open `/` to view live health, throughput, latency, reservation outcomes and seat reconciliation. The **Run demo** button creates a fresh show and runs one of two fixed presets:
 
 | Preset | Requests | Concurrent clients | Seats |
 |---|---|---|---|
 | Quick demo | 2,000 | 16 | 500 |
-| Assignment burst | 20,000 | 32 | 5,000 |
+| Extended demo | 20,000 | 32 | 5,000 |
 
 The request mix is 40% hot-seat contention, 10% retries, 1% key reuse, 200 per-user-limit attempts, and random single/multi-seat requests. Final checks cover all-or-nothing booking, owner-only double cancellation, guaranteed rebooking, spoofed identity, and a late cancellation after rebooking. Outcomes count the initial reservation burst; the subsequent checks also appear in service metrics.
 
 Runs are shared across visitors on the instance. `POST /api/burst` accepts only `{"preset":"demo"}` or `{"preset":"full"}`; `GET /api/burst` returns live progress and the latest results. Only one run can execute at a time, followed by a 5-minute cooldown (`BURST_COOLDOWN_SECONDS`, default 300). Runs are limited to ten minutes, and results are held in memory until the next run or restart. The public runner creates demo inventory; it never returns credentials or accepts a target URL.
 
-Dashboard requests use the local HTTP reservation API on the deployed server, so they exercise actual transactions and metrics without sending the admin key to the browser. They do **not** measure the Render edge/network. Use `./burst.sh <PUBLIC_URL>` for that external load test.
+Dashboard requests use the local HTTP reservation API on the deployed server, so they exercise actual transactions and metrics without sending the admin key to the browser. They do **not** measure the public ingress/network or 20,000 simultaneous buyers. Both presets are bounded demonstrations, not assignment acceptance tests. Use `./burst.sh <PUBLIC_URL>` for that external load test.
 
 ## API
 
@@ -122,12 +126,12 @@ curl -s -XPOST $B/shows/$SHOW/reserve -H "Authorization: Bearer $TOKEN" -H 'cont
 To capture resource evidence during a manual live test, start this read-only recorder in another terminal before the burst:
 
 ```bash
-python3 scripts/record_metrics.py https://seat-reservation-62kf.onrender.com --seconds 300 --output /tmp/seatlab-live-metrics.jsonl
+python3 scripts/record_metrics.py https://p01--seat-reservation--tc65zqzsjs45.code.run --seconds 300 --output /tmp/seatlab-live-metrics.jsonl
 ```
 
-It samples every two seconds, saves JVM memory/GC, CPU time, process uptime, connection-pool and reservation metrics, and records failed scrapes and observed uptime resets. It sends no reservations. Failed scrapes leave observation gaps; JVM metrics do not measure complete container RSS, and CPU usage gauges are not a direct percentage of Render's quota. Cumulative CPU-time deltas between successful scrapes can estimate average core usage for that interval. No credentials are needed.
+It samples every two seconds, saves JVM memory/GC, CPU time, process uptime, connection-pool and reservation metrics, and records failed scrapes and observed uptime resets. It sends no reservations. Failed scrapes leave observation gaps; JVM metrics do not measure complete container RSS, and CPU usage gauges are not a direct percentage of the hosting allocation. Cumulative CPU-time deltas between successful scrapes can estimate average core usage for that interval. No credentials are needed.
 
-The server also writes `resource_sample` structured log entries every five seconds from its own dedicated thread. These include instance ID, uptime, heap/nonheap/direct memory, CPU cores used over the actual sampling interval, cumulative GC time and DB active/idle/waiting counts. When accessible on Linux, the cgroup memory counter is included as `container_memory_bytes`; this is container memory accounting, not JVM heap or process RSS. No database query or public HTTP request is needed. Each sample also includes Undertow worker queue length (`http_worker_queue`), busy/max worker counts, and available Linux CPU-throttling counters (`cpu_throttled_periods_total/delta`, `cpu_throttled_usec_total/delta`, `cpu_periods_total/delta`). The `_delta` fields cover the actual sampling interval, not necessarily five seconds. Availability flags distinguish unsupported readings from zero; the first CPU-throttling sample has totals only. Throttled microseconds are normalized across cgroup v1/v2. These counters describe the visible cgroup, and zero does not rule out restrictions imposed by an inaccessible ancestor cgroup. The worker queue measures dispatched tasks, not all TCP connections or requests waiting upstream. Search Render logs for `resource_sample` during a burst. Samples can still be delayed by CPU starvation, GC pauses or logging backpressure, so inspect `sample_interval_seconds` and timestamp gaps. Set `resource.sampling.enabled=false` to disable it.
+The server also writes `resource_sample` structured log entries every five seconds from its own dedicated thread. These include instance ID, uptime, heap/nonheap/direct memory, CPU cores used over the actual sampling interval, cumulative GC time and DB active/idle/waiting counts. When accessible on Linux, the cgroup memory counter is included as `container_memory_bytes`; this is container memory accounting, not JVM heap or process RSS. No database query or public HTTP request is needed. Each sample also includes Undertow worker queue length (`http_worker_queue`), busy/max worker counts, and available Linux CPU-throttling counters (`cpu_throttled_periods_total/delta`, `cpu_throttled_usec_total/delta`, `cpu_periods_total/delta`). The `_delta` fields cover the actual sampling interval, not necessarily five seconds. Availability flags distinguish unsupported readings from zero; the first CPU-throttling sample has totals only. Throttled microseconds are normalized across cgroup v1/v2. These counters describe the visible cgroup, and zero does not rule out restrictions imposed by an inaccessible ancestor cgroup. The worker queue measures dispatched tasks, not all TCP connections or requests waiting upstream. Search Northflank runtime logs for `resource_sample` during a burst. Owner-authenticated live access and public captured excerpts are described in [evidence/README.md](evidence/README.md). Samples can still be delayed by CPU starvation, GC pauses or logging backpressure, so inspect `sample_interval_seconds` and timestamp gaps. Set `resource.sampling.enabled=false` to disable it.
 
 ## Regression tests
 
@@ -177,19 +181,19 @@ An additional 16-worker CPU-limited comparison found every servlet worker waitin
 With this change, the profiled 16-worker run received 5,665 responses before 14,335 timeouts, compared with 165 responses and 19,835 timeouts without buffering. Both failed acceptance; final inventory reads timed out and phase 2 was not verified. The unrestricted local 20,000-request burst passed in 4.5 seconds and all 22 PostgreSQL/unit regression tests passed. These results do not establish a CPU-limited or live pass, and the 64-worker production default is retained pending comparison.
 
 
-## Deploy (Render + Neon, both free)
+## Alternative deployment (Render + Neon)
 
 1. Neon: create a project → copy host, database, user, password.
 2. Render: *New → Blueprint* → this repo (uses `render.yaml`). Set
    `DATABASE_URL=jdbc:postgresql://<host>/<db>?sslmode=require`, `DATABASE_USER`, `DATABASE_PASSWORD`.
    `TOKEN_SECRET` and `ADMIN_KEY` are generated; copy `ADMIN_KEY` for `burst.sh`.
-3. No Render health check, deliberately: Render evicts an instance whose check takes >5s for 15s and restarts it after 60s; on 0.1 CPU a burst queues health checks past that, so the check would take down a busy-but-correct instance. In Render → Settings, leave **Health Check Path empty**. A crashed process is still restarted.
+3. The historical Render deployment left Health Check Path empty after health-probe delays were observed under overload. Readiness remains available for monitoring and fails when PostgreSQL is unreachable. This setting does not resolve the recorded public burst failures; Northflank is the current primary deployment.
 
 Config: `PORT`, `DATABASE_URL`, `DATABASE_USER`, `DATABASE_PASSWORD`, `DB_POOL_SIZE` (10), `TOKEN_SECRET`, `ADMIN_KEY`.
 
 ## Northflank Sandbox deployment
 
-Create a combined service from this repository's `main` branch using `/Dockerfile`, and expose HTTP port 8080 publicly. Select the free Sandbox allocation; our deployed service has 0.2 shared CPU and 512 MiB RAM. Set runtime variables `PORT=8080`, `DATABASE_URL` (the Neon JDBC URL with `sslmode=require`), `DATABASE_USER`, `DATABASE_PASSWORD`, `ADMIN_KEY`, and `TOKEN_SECRET`. Without `DATABASE_URL`, the application defaults to localhost PostgreSQL and cannot start in this container. Keep credentials in Northflank runtime secrets, never in Git.
+Create a combined service from this repository's `main` branch using `/Dockerfile`, and expose HTTP port 8080 publicly. Select the free Sandbox allocation; our deployed service has 0.2 shared CPU and 512 MiB RAM. Set runtime variables `PORT=8080`, `DATABASE_URL` (a PostgreSQL JDBC URL with `sslmode=require`), `DATABASE_USER`, `DATABASE_PASSWORD`, `ADMIN_KEY`, and `TOKEN_SECRET`. Without `DATABASE_URL`, the application defaults to localhost PostgreSQL and cannot start in this container. Keep credentials in Northflank runtime secrets, never in Git.
 
 For the Northflank deployment, prefer its Sandbox PostgreSQL addon in the same project instead of a distant Neon region. The current service uses a private, TLS-enabled PostgreSQL 18 addon (`seat-postgres`) with one `nf-compute-20` replica, the minimum 4096 MiB disk, and disk autoscaling disabled. Set `DATABASE_URL` to `jdbc:postgresql://<private-addon-host>:5432/seats?sslmode=require` and use the addon's non-admin credentials. Keep external database access disabled; use CLI port forwarding for maintenance. The existing data was copied from a consistent Neon snapshot and verified by counts and content checksums across all four tables before switching the service. Neon remains unchanged for rollback; the two deployments do not replicate subsequent writes. The Sandbox includes one free database, so verify the account allowance before creating an additional addon.
 
